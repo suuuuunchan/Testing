@@ -206,6 +206,8 @@
   #export-prog-fill { height:100%; background:#fff; border-radius:1px; width:0%; transition:width 0.1s; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/webm-muxer@5.0.3/build/webm-muxer.min.js"></script>
 </head>
 <body>
 
@@ -2244,10 +2246,17 @@ document.getElementById('export-gif-btn').addEventListener('click', async () => 
     gif.on('progress', pct => showProgress('Encoding GIF…', 0.5 + pct * 0.5));
     gif.on('finished', blob => {
       download(URL.createObjectURL(blob), `sticky_${Date.now()}.gif`);
-      // Terminate gif.js workers immediately after download.
-      // Without this, up to 8 Web Workers stay alive as zombies and compete
-      // for CPU during any subsequent export (especially MP4 frame rendering).
-      gif.abort();
+      // ── Full cleanup to prevent slowdown on subsequent exports ─────────
+      // 1) Terminate all Web Workers (otherwise up to 8 zombies steal CPU).
+      // 2) Drop frame ImageData (~400MB at 50fps × 3s × 800² holds in `frames`
+      //    array even after render completes — triggers major GC on next export).
+      // 3) Remove event listeners to break the gif↔listener cyclic reference
+      //    so the entire gif object becomes eligible for GC immediately.
+      try { gif.abort(); } catch {}
+      gif.frames = [];
+      gif.freeWorkers = [];
+      gif.activeWorkers = [];
+      if (typeof gif.removeAllListeners === 'function') gif.removeAllListeners();
       hideProgress();
       btn.textContent = 'GIF'; btn.style.opacity = '';
       if (resumeAfter) startMotion();
@@ -2279,42 +2288,112 @@ document.getElementById('export-gif-btn').addEventListener('click', async () => 
 });
 
 // ── Export MP4 ─────────────────────────────────────
-// WebCodecs path: renders all frames offline with precise timestamps, then
-// muxes to WebM. Avoids the captureStream timing drift where slow SVG
-// rasterization (>16.7ms/frame) causes the recorded video to play too fast.
-// Falls back to MediaRecorder on browsers without VideoEncoder support.
+// Strategy:
+//   1) Detect monitor refresh rate (60/120/144Hz) once → MP4 plays back
+//      identically to the on-screen preview, no perceived motion downgrade.
+//   2) WebCodecs VideoEncoder renders all frames offline with precise
+//      timestamps (no captureStream wall-clock drift).
+//   3) mp4-muxer wraps the AVC stream into a real .mp4 container; webm-muxer
+//      handles VP9/VP8 fallback. The previous home-grown WebM builder was
+//      mislabeled as .mp4, producing broken files.
 
-async function exportMP4_webcodecs(W, H, dpr, fps, total, dur, fontCSS, btn) {
+let _detectedFps = null;
+function detectRefreshRate() {
+  if (_detectedFps) return Promise.resolve(_detectedFps);
+  return new Promise(res => {
+    const samples = [];
+    let prev = performance.now(), n = 0;
+    function tick(t) {
+      if (n > 0) samples.push(t - prev);
+      prev = t; n++;
+      if (n < 30) requestAnimationFrame(tick);
+      else {
+        // Use median to reject outliers
+        samples.sort((a, b) => a - b);
+        const med = samples[samples.length >> 1];
+        const rate = 1000 / med;
+        // Snap to common monitor rates
+        const snap = [60, 90, 120, 144, 165, 240]
+          .reduce((p, c) => Math.abs(c - rate) < Math.abs(p - rate) ? c : p, 60);
+        _detectedFps = Math.max(60, snap);
+        res(_detectedFps);
+      }
+    }
+    requestAnimationFrame(tick);
+  });
+}
+
+async function exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn) {
   const Wp = Math.round(W * dpr), Hp = Math.round(H * dpr);
-
-  // Simple WebM muxer — EBML/Matroska subset sufficient for a single VP9 track
-  const muxChunks = [];
-  let encodedCount = 0;
   const frameDurationUs = Math.round(1_000_000 / fps);
 
-  // Detect best codec: prefer AVC if VideoEncoder supports it, else VP8
-  let codec = 'vp8';
-  try { if ((await VideoEncoder.isConfigSupported({ codec:'avc1.42E028', width:Wp, height:Hp })).supported) codec = 'avc1.42E028'; } catch {}
+  // ── Codec selection: prefer AVC (real .mp4) → VP9 → VP8 ────────────────
+  // High Profile gives better compression at high bitrate; fall back through
+  // baseline if H/W encoder rejects it.
+  const codecCandidates = [
+    { codec: 'avc1.640028', container: 'mp4' }, // H.264 High@L4
+    { codec: 'avc1.4D0028', container: 'mp4' }, // H.264 Main@L4
+    { codec: 'avc1.42E028', container: 'mp4' }, // H.264 Baseline@L4
+    { codec: 'vp09.00.10.08', container: 'webm' }, // VP9
+    { codec: 'vp8', container: 'webm' },
+  ];
+  let chosen = null;
+  for (const c of codecCandidates) {
+    try {
+      const sup = await VideoEncoder.isConfigSupported({
+        codec: c.codec, width: Wp, height: Hp, framerate: fps,
+      });
+      if (sup.supported) { chosen = c; break; }
+    } catch {}
+  }
+  if (!chosen) throw new Error('No supported video codec');
 
-  // We collect raw encoded chunks then wrap in a minimal WebM container
-  const rawChunks = [];
-  let encoderDone;
-  const encoderFlushed = new Promise(res => { encoderDone = res; });
+  const ext = chosen.container;
+  const mimeType = ext === 'mp4' ? 'video/mp4' : 'video/webm';
+
+  // ── Muxer setup: real MP4/WebM container via dedicated muxer libraries ──
+  let muxer;
+  if (ext === 'mp4') {
+    if (typeof Mp4Muxer === 'undefined') throw new Error('mp4-muxer 로드 실패');
+    muxer = new Mp4Muxer.Muxer({
+      target: new Mp4Muxer.ArrayBufferTarget(),
+      video: { codec: 'avc', width: Wp, height: Hp, frameRate: fps },
+      fastStart: 'in-memory',
+    });
+  } else {
+    if (typeof WebMMuxer === 'undefined') throw new Error('webm-muxer 로드 실패');
+    muxer = new WebMMuxer.Muxer({
+      target: new WebMMuxer.ArrayBufferTarget(),
+      video: {
+        codec: chosen.codec.startsWith('vp09') ? 'V_VP9' : 'V_VP8',
+        width: Wp, height: Hp, frameRate: fps,
+      },
+    });
+  }
+
+  // ── Encoder: scale bitrate with pixel density × framerate ──────────────
+  // 60fps@1× ≈ 10 Mbps, 120fps@2× ≈ 40 Mbps. Capped at 50 Mbps.
+  const bitrate = Math.min(50_000_000,
+    Math.round(8_000_000 * Math.max(1, dpr) * (fps / 60)));
 
   const encoder = new VideoEncoder({
-    output: (chunk, meta) => { rawChunks.push({ chunk, meta }); },
+    output: (chunk, meta) => muxer.addVideoChunk(chunk, meta),
     error: e => { throw e; },
   });
   encoder.configure({
-    codec,
+    codec: chosen.codec,
     width: Wp, height: Hp,
     framerate: fps,
-    bitrate: dpr >= 2 ? 20_000_000 : 10_000_000,
+    bitrate,
     latencyMode: 'quality',
+    ...(ext === 'mp4' ? { avc: { format: 'avc' } } : {}),
   });
 
   const work = document.createElement('canvas');
   work.width = Wp; work.height = Hp;
+
+  // Keyframe every 1s for reasonable seekability without bloating bitrate
+  const keyEvery = fps;
 
   for (let i = 0; i < total; i++) {
     renderMotionFrame(i / fps, 1);
@@ -2324,106 +2403,35 @@ async function exportMP4_webcodecs(W, H, dpr, fps, total, dur, fontCSS, btn) {
       timestamp: i * frameDurationUs,
       duration: frameDurationUs,
     });
-    encoder.encode(frame, { keyFrame: i % 30 === 0 });
+    encoder.encode(frame, { keyFrame: i % keyEvery === 0 });
     frame.close();
     bitmap.close();
-    setProgress((i + 1) / total * 0.85);
+    setProgress((i + 1) / total * 0.9);
     btn.textContent = `${i + 1}/${total}`;
-    if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+    // Throttle queue depth so encoder doesn't fall too far behind (memory)
+    if (encoder.encodeQueueSize > 8) {
+      await new Promise(r => setTimeout(r, 0));
+    } else if (i % 4 === 3) {
+      await new Promise(r => setTimeout(r, 0));
+    }
   }
 
-  showProgress('Muxing…', 0.85);
+  showProgress('Muxing…', 0.92);
   await encoder.flush();
   encoder.close();
-
-  // Build a minimal WebM container around the encoded chunks
-  const blob = buildWebM(rawChunks, Wp, Hp, fps, dur, codec.startsWith('avc') ? 'V_MPEG4/ISO/AVC' : 'V_VP8');
-  download(URL.createObjectURL(blob), `sticky_${Date.now()}.${codec.startsWith('avc') ? 'mp4' : 'webm'}`);
-}
-
-// Minimal EBML/WebM builder — enough for a single video track, no audio
-function buildWebM(rawChunks, W, H, fps, dur, codecId) {
-  function eb(id, data) {
-    const d = typeof data === 'number' ? encodeVInt(data, true) :
-              data instanceof Uint8Array ? data : encodeStr(data);
-    return concat(encodeId(id), encodeSize(d.length), d);
-  }
-  function ef(id, f) { // float64
-    const buf = new ArrayBuffer(8); new DataView(buf).setFloat64(0, f); return concat(encodeId(id), new Uint8Array([0x88]), new Uint8Array(buf)); }
-  function eu(id, n, len=4) { // uint fixed-width
-    const buf = new Uint8Array(len); let v=n; for(let i=len-1;i>=0;i--){buf[i]=v&0xff;v>>=8;} return concat(encodeId(id), encodeSize(len), buf); }
-  function encodeId(id) { const h=[]; let n=id; while(n>0){h.unshift(n&0xff);n>>=8;} return new Uint8Array(h); }
-  function encodeSize(n) {
-    if(n<0x7f){return new Uint8Array([0x80|n]);}
-    if(n<0x3fff){return new Uint8Array([0x40|(n>>8),n&0xff]);}
-    if(n<0x1fffff){return new Uint8Array([0x20|(n>>16),(n>>8)&0xff,n&0xff]);}
-    return new Uint8Array([0x10|(n>>24),(n>>16)&0xff,(n>>8)&0xff,n&0xff]);
-  }
-  function encodeVInt(n, asSigned=false) { // variable-length uint for EBML values
-    const buf=[];let v=n;do{buf.unshift(v&0xff);v>>>=8;}while(v>0);return new Uint8Array(buf);}
-  function encodeStr(s) { return new TextEncoder().encode(s); }
-  function concat(...arrays) {
-    const total=arrays.reduce((s,a)=>s+a.length,0),out=new Uint8Array(total);
-    let off=0;for(const a of arrays){out.set(a,off);off+=a.length;}return out;
-  }
-  function master(id, ...children) { const body=concat(...children); return concat(encodeId(id), encodeSize(body.length), body); }
-
-  const durMs = dur * 1000;
-  const timescale = 1000;
-  const trackEntry = master(0xAE,
-    eu(0xD7, 1, 1),           // TrackNumber
-    eu(0x73C5, 1, 4),         // TrackUID
-    eu(0x83, 1, 1),           // TrackType = video
-    eb(0x86, codecId),        // CodecID
-    eu(0x23E383, Math.round(1_000_000_000 / fps), 4), // DefaultDuration (ns)
-    master(0xE0,              // Video
-      eu(0xB0, W, 2),
-      eu(0xBA, H, 2),
-    ),
-  );
-  const tracks = master(0x1654AE6B, trackEntry);
-
-  // Build cluster with SimpleBlocks
-  const blockParts = [];
-  for (const { chunk } of rawChunks) {
-    const data = new Uint8Array(chunk.byteLength);
-    chunk.copyTo(data);
-    const tcMs = Math.round(chunk.timestamp / 1000); // us → ms
-    const header = new Uint8Array(4);
-    header[0] = 0x81; // track 1, VINT encoded
-    header[1] = (tcMs >> 8) & 0xff; // relative timecode (16-bit)
-    header[2] = tcMs & 0xff;
-    header[3] = chunk.type === 'key' ? 0x80 : 0x00; // flags
-    blockParts.push(concat(encodeId(0xA3), encodeSize(header.length + data.length), header, data));
-  }
-  const cluster = master(0x1F43B675,
-    eu(0xE7, 0, 4), // ClusterTimecode = 0
-    ...blockParts,
-  );
-
-  const segInfo = master(0x1549A966,
-    ef(0x4489, timescale),    // TimecodeScale
-    ef(0x4461, durMs),        // Duration
-    eb(0x4D80, 'StickyExport'),
-  );
-  const segment = concat(
-    encodeId(0x18538067),
-    new Uint8Array([0x01,0xff,0xff,0xff,0xff,0xff,0xff,0xff]), // unknown size sentinel
-    segInfo, tracks, cluster,
-  );
-  const ebmlHeader = master(0x1A45DFA3,
-    eu(0x4286, 1, 1), eu(0x42F7, 1, 1), eu(0x42F2, 4, 1), eu(0x42F3, 8, 1),
-    eb(0x4282, 'webm'),
-    eu(0x4287, 2, 1), eu(0x4285, 2, 1),
-  );
-  return new Blob([concat(ebmlHeader, segment)], { type: 'video/webm' });
+  muxer.finalize();
+  const blob = new Blob([muxer.target.buffer], { type: mimeType });
+  download(URL.createObjectURL(blob), `sticky_${Date.now()}.${ext}`);
 }
 
 document.getElementById('export-mp4-btn').addEventListener('click', async () => {
   if (!S.motionOn) { alert('먼저 모션을 활성화(Play)해주세요.'); return; }
   const btn = document.getElementById('export-mp4-btn');
   const dur = exportDuration;
-  const fps = 60;
+  // Match preview frame rate (preview uses requestAnimationFrame = monitor refresh).
+  // Min 60fps so older monitors still get smooth motion; cap at 120fps to keep
+  // file size sane even on 240Hz displays.
+  const fps = Math.min(120, await detectRefreshRate());
   const total = Math.round(dur * fps);
   btn.textContent = '…'; btn.style.opacity = '.5';
   let resumeAfter = false;
@@ -2438,7 +2446,7 @@ document.getElementById('export-mp4-btn').addEventListener('click', async () => 
 
     // WebCodecs path: precise timestamps, no real-time constraint, faster
     if (typeof VideoEncoder !== 'undefined') {
-      await exportMP4_webcodecs(W, H, dpr, fps, total, dur, fontCSS, btn);
+      await exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn);
       hideProgress();
       btn.textContent = 'MP4'; btn.style.opacity = '';
       if (resumeAfter) startMotion();
