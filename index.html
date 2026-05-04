@@ -639,16 +639,6 @@
           <button class="btn-ghost" id="export-gif-btn" style="letter-spacing:.18em">GIF</button>
           <button class="btn-ghost" id="export-mp4-btn" style="letter-spacing:.18em">MP4</button>
         </div>
-        <div class="control-row" style="margin-bottom:9px">
-          <span class="lbl">Scale</span>
-          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;flex:1">
-            <button class="pill" data-scale="1">1×</button>
-            <button class="pill" data-scale="2">2×</button>
-            <button class="pill on" data-scale="3">3×</button>
-            <button class="pill" data-scale="4">4×</button>
-          </div>
-          <span style="font-size:9px;color:var(--muted);flex-shrink:0;width:28px;text-align:right" id="export-scale-px">—</span>
-        </div>
         <div class="control-row" style="margin-bottom:0">
           <span class="lbl">Duration</span>
           <input type="range" id="export-dur-slider" min="1" max="10" value="3" step="1" style="flex:1;min-width:0">
@@ -2010,32 +2000,6 @@ function download(url, name) {
   Object.assign(document.createElement('a'), { href: url, download: name }).click();
 }
 
-// ── Export: scale (PNG resolution multiplier) ──────
-let exportScale = 3;
-{
-  const pills = document.querySelectorAll('[data-scale]');
-  const pxLabel = document.getElementById('export-scale-px');
-
-  function updateScalePx() {
-    const r = canvasWrap.getBoundingClientRect();
-    const px = Math.round(r.width * exportScale);
-    pxLabel.textContent = px + 'px';
-  }
-
-  pills.forEach(btn => {
-    btn.addEventListener('click', () => {
-      pills.forEach(b => b.classList.remove('on'));
-      btn.classList.add('on');
-      exportScale = parseInt(btn.dataset.scale);
-      updateScalePx();
-    });
-  });
-
-  // Update px label whenever canvas resizes
-  new ResizeObserver(updateScalePx).observe(canvasWrap);
-  updateScalePx();
-}
-
 // ── Export: duration ───────────────────────────────
 let exportDuration = 3;
 {
@@ -2232,13 +2196,9 @@ document.getElementById('export-png-btn').addEventListener('click', async () => 
   const btn = document.getElementById('export-png-btn');
   btn.textContent = '…'; btn.style.opacity = '.5';
   try {
-    const { W, H } = getExportSize();
-    // Use exportScale instead of devicePixelRatio so the user controls output
-    // resolution explicitly (1× = CSS size, 2× = Retina, 3× = high-quality
-    // print/display, 4× = maximum). toBlob avoids the huge base64 string that
-    // toDataURL produces for large canvases, reducing peak memory by ~33%.
+    const { W, H, dpr } = getExportSize();
     const fontCSS = await getEmbeddedFont(S.fontFamily, S.fontWeight);
-    const cv = await rasterizeFrameToCanvas(W, H, exportScale, fontCSS);
+    const cv = await rasterizeFrameToCanvas(W, H, dpr, fontCSS);
     const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
     download(URL.createObjectURL(blob), `sticky_${Date.now()}.png`);
   } catch(e) {
@@ -2272,10 +2232,7 @@ document.getElementById('export-gif-btn').addEventListener('click', async () => 
   try {
     const workerUrl = await ensureGifWorker();
     const { W, H, dpr } = getExportSize();
-    // GIF's 256-color palette gains nothing from 2× pixel density — cap at 1×
-    // for 4× fewer pixels and dramatically faster gif.js encoding.
-    const gifDpr = 1;
-    const Wp = Math.round(W * gifDpr), Hp = Math.round(H * gifDpr);
+    const Wp = Math.round(W * dpr), Hp = Math.round(H * dpr);
     const fontCSS = await getEmbeddedFont(S.fontFamily, S.fontWeight);
 
     resumeAfter = !!animFrame;
@@ -2306,7 +2263,7 @@ document.getElementById('export-gif-btn').addEventListener('click', async () => 
     const work = document.createElement('canvas');
     for (let i = 0; i < total; i++) {
       renderMotionFrame(i / fps, 1);
-      await rasterizeFrameToCanvas(W, H, gifDpr, fontCSS, work);
+      await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
       gif.addFrame(work, { delay: frameDelay, copy: true });
       const p = (i + 1) / total * 0.5;
       setProgress(p);
