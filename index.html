@@ -154,6 +154,7 @@
   .btn-primary:hover { opacity:.7; }
   .btn-ghost { background:transparent; color:var(--muted); border:1px solid var(--border); border-radius:var(--r); padding:8px 0; font-family:'Delight',system-ui; font-size:9px; font-weight:700; letter-spacing:.12em; text-transform:uppercase; cursor:pointer; width:100%; transition:all .15s; }
   .btn-ghost:hover { border-color:var(--bhi); color:var(--text); }
+  .btn-ghost.on { background:var(--accent); border-color:var(--accent); color:#fff; }
 
   /* ── Preview ── */
   #preview-area { flex:1; display:flex; align-items:center; justify-content:center; background:var(--bg); position:relative; overflow:hidden; }
@@ -208,7 +209,6 @@
 <script src="https://cdn.jsdelivr.net/npm/gif.js@0.2.0/dist/gif.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/mp4-muxer@5.2.2/build/mp4-muxer.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/webm-muxer@5.0.3/build/webm-muxer.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/upng-js@2.1.0/UPNG.js"></script>
 </head>
 <body>
 
@@ -635,17 +635,45 @@
             <div class="toggle-thumb"></div>
           </label>
         </div>
-        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:14px">
-          <button class="btn-ghost" id="export-png-btn" style="letter-spacing:.18em">PNG</button>
-          <button class="btn-ghost" id="export-gif-btn" style="letter-spacing:.18em">GIF</button>
-          <button class="btn-ghost" id="export-mp4-btn" style="letter-spacing:.18em">MP4</button>
+        <!-- Format tabs (click to switch options panel below) -->
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:12px" id="export-tabs">
+          <button class="btn-ghost on" data-fmt="png" style="letter-spacing:.18em">PNG</button>
+          <button class="btn-ghost"    data-fmt="gif" style="letter-spacing:.18em">GIF</button>
+          <button class="btn-ghost"    data-fmt="mp4" style="letter-spacing:.18em">MP4</button>
         </div>
-        <div class="control-row" style="margin-bottom:0">
-          <span class="lbl">Duration</span>
-          <input type="range" id="export-dur-slider" min="1" max="10" value="3" step="1" style="flex:1;min-width:0">
-          <input type="number" class="val-input" id="export-dur-val" min="1" max="10" step="1" value="3">
-          <span style="font-size:9px;color:var(--muted);flex-shrink:0">s</span>
+
+        <!-- PNG options -->
+        <div class="export-pane" data-pane="png">
+          <div class="control-row" style="margin-bottom:0">
+            <span class="lbl">Scale</span>
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;flex:1">
+              <button class="pill"    data-scale="1">1×</button>
+              <button class="pill"    data-scale="2">2×</button>
+              <button class="pill on" data-scale="3">3×</button>
+              <button class="pill"    data-scale="4">4×</button>
+            </div>
+          </div>
         </div>
+
+        <!-- GIF options (none — loops based on motion cycle) -->
+        <div class="export-pane" data-pane="gif" style="display:none">
+          <div style="font-size:9px;color:var(--muted);text-align:center;padding:6px 0;letter-spacing:.1em" id="gif-loop-info">
+            Auto loop: motion cycle
+          </div>
+        </div>
+
+        <!-- MP4 options -->
+        <div class="export-pane" data-pane="mp4" style="display:none">
+          <div class="control-row" style="margin-bottom:0">
+            <span class="lbl">Duration</span>
+            <input type="range" id="export-dur-slider" min="1" max="10" value="3" step="1" style="flex:1;min-width:0">
+            <input type="number" class="val-input" id="export-dur-val" min="1" max="10" step="1" value="3">
+            <span style="font-size:9px;color:var(--muted);flex-shrink:0">s</span>
+          </div>
+        </div>
+
+        <!-- Single Export action -->
+        <button class="btn-primary" id="export-do-btn" style="margin-top:14px">Export</button>
       </div>
     </div>
   </div>
@@ -2193,31 +2221,22 @@ function getExportSize() {
 }
 
 // ── Export PNG ─────────────────────────────────────
-document.getElementById('export-png-btn').addEventListener('click', async () => {
-  const btn = document.getElementById('export-png-btn');
+async function runPngExport(btn) {
   btn.textContent = '…'; btn.style.opacity = '.5';
   try {
-    const { W, H, dpr } = getExportSize();
+    const { W, H } = getExportSize();
     const fontCSS = await getEmbeddedFont(S.fontFamily, S.fontWeight);
-    const cv = await rasterizeFrameToCanvas(W, H, dpr, fontCSS);
-    const Wp = cv.width, Hp = cv.height;
-    let blob;
-    if (typeof UPNG !== 'undefined') {
-      // UPNG lossless: same pixel-perfect quality as toBlob but uses better
-      // deflate compression + auto-detects RGB vs RGBA → 30–40% smaller files.
-      const id = cv.getContext('2d').getImageData(0, 0, Wp, Hp);
-      const buf = UPNG.encode([id.data.buffer], Wp, Hp, 0); // 0 = lossless
-      blob = new Blob([buf], { type: 'image/png' });
-    } else {
-      blob = await new Promise(res => cv.toBlob(res, 'image/png'));
-    }
+    // Use user-chosen scale (1×–4×) instead of devicePixelRatio so output
+    // resolution is explicit and predictable.
+    const cv = await rasterizeFrameToCanvas(W, H, exportScale, fontCSS);
+    const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
     download(URL.createObjectURL(blob), `sticky_${Date.now()}.png`);
   } catch(e) {
     console.error(e);
     alert(e.message || 'PNG Export 실패');
   }
-  btn.textContent = 'PNG'; btn.style.opacity = '';
-});
+  btn.textContent = 'Export'; btn.style.opacity = '';
+}
 
 // ── Export GIF (real GIF via gif.js) ───────────────
 let _gifWorkerUrl = null;
@@ -2229,14 +2248,38 @@ async function ensureGifWorker() {
   return _gifWorkerUrl;
 }
 
-document.getElementById('export-gif-btn').addEventListener('click', async () => {
+// Per-motion natural cycle period (seconds) at motionSpeed = 1.
+// Derived directly from each motion's phase math in renderMotionFrame:
+//   phi = 2π·rawT·motionSpeed; sin/cos cycle when their argument advances 2π.
+// For per-character motions with mixed rates (bubble/melt/flex), pick the rate
+// that yields a visually clean loop (typically the dominant oscillation).
+function getMotionLoopDuration(type, speed) {
+  const sp = Math.max(0.01, speed || 1);
+  const periods = {
+    breathe: 1 / 0.7,    // sin(phi · 0.7)              ≈1.43 s
+    bump:    1 / 0.5,    // sin(phi · 0.5)              = 2 s
+    wave:    1 / 0.5,    // sin(phi · 0.5)              = 2 s
+    stretch: 1 / 0.42,   // (phi · 0.42) % 2π            ≈2.38 s
+    bubble:  1 / 0.6,    // dominant osc rate (r1 ≥ 0.6) ≈1.67 s
+    melt:    1 / 0.22,   // slowest drip rate            ≈4.55 s
+    flex:    0.55 * 4,   // 4 beats × 0.55 s/beat        = 2.2 s
+  };
+  return (periods[type] || 2) / sp;
+}
+
+async function runGifExport(btn) {
   if (!S.motionOn) { alert('먼저 모션을 활성화(Play)해주세요.'); return; }
-  const btn = document.getElementById('export-gif-btn');
-  const dur = exportDuration;
-  // 50fps = 20ms delay = GIF spec minimum; safe maximum across all browsers
-  const fps = 50;
-  const frameDelay = 20;
-  const total = Math.round(dur * fps);
+
+  // ── Loop-aware duration ─────────────────────────────────────────────────
+  // Render exactly one motion period so the GIF loops seamlessly when played
+  // back. Frames are sampled uniformly over [0, period) — frame N would equal
+  // frame 0, so we omit it. Frame delay is derived from period/N to keep
+  // playback speed exactly matching the live preview.
+  const period = getMotionLoopDuration(S.motionType, S.motionSpeed);
+  const targetFps = 50; // GIF spec maximum (20ms/frame floor)
+  const total = Math.max(2, Math.round(period * targetFps));
+  // GIF delay is in 10ms units → snap to nearest centisecond (min 20ms = 50fps cap)
+  const frameDelay = Math.max(20, Math.round((period * 1000 / total) / 10) * 10);
 
   btn.textContent = '…'; btn.style.opacity = '.5';
   let resumeAfter = false;
@@ -2254,68 +2297,25 @@ document.getElementById('export-gif-btn').addEventListener('click', async () => 
     gif.on('progress', pct => showProgress('Encoding GIF…', 0.5 + pct * 0.5));
     gif.on('finished', blob => {
       download(URL.createObjectURL(blob), `sticky_${Date.now()}.gif`);
-      // ── Full cleanup to prevent slowdown on subsequent exports ─────────
-      // 1) Terminate all Web Workers (otherwise up to 8 zombies steal CPU).
-      // 2) Drop frame ImageData (~400MB at 50fps × 3s × 800² holds in `frames`
-      //    array even after render completes — triggers major GC on next export).
-      // 3) Remove event listeners to break the gif↔listener cyclic reference
-      //    so the entire gif object becomes eligible for GC immediately.
       try { gif.abort(); } catch {}
       gif.frames = [];
       gif.freeWorkers = [];
       gif.activeWorkers = [];
       if (typeof gif.removeAllListeners === 'function') gif.removeAllListeners();
       hideProgress();
-      btn.textContent = 'GIF'; btn.style.opacity = '';
+      btn.textContent = 'Export'; btn.style.opacity = '';
       if (resumeAfter) startMotion();
     });
 
     showProgress('Rendering frames…', 0);
     const work = document.createElement('canvas');
-
-    // ── Frame differencing ───────────────────────────────────────────────
-    // For opaque exports: replace every pixel that hasn't changed since the
-    // previous frame with a transparent key colour (magenta 0xff00ff).
-    // gif.js marks that key colour as the GIF transparent index → unchanged
-    // regions are skipped by the decoder, composite from the previous frame.
-    // Result: only the bounding region of actual motion is re-encoded each
-    // frame → 50–80% smaller for typical slow/medium motion text animations.
-    // Skipped for transparent-background exports (layering semantics differ).
-    const DIFF_KEY = 0xff00ff; // R=255 G=0 B=255 — magenta, rare in text designs
-    // Uint32 LE representation of opaque magenta in ImageData (RGBA bytes):
-    //   byte0=R=0xff, byte1=G=0x00, byte2=B=0xff, byte3=A=0xff → 0xffff00ff
-    const DIFF_KEY32 = 0xffff00ff >>> 0;
-    const diffCanvas = document.createElement('canvas');
-    let prevPx32 = null; // Uint32Array view of previous frame's pixel buffer
-
+    // Sample i = 0 .. total-1 across [0, period) so frame `total` would alias
+    // back to frame 0 — guarantees seamless loop without a duplicate end frame.
     for (let i = 0; i < total; i++) {
-      renderMotionFrame(i / fps, 1);
+      const t = (i / total) * period;
+      renderMotionFrame(t, 1);
       await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
-
-      if (!S.transparentBg && prevPx32) {
-        // Read current frame pixels (GPU→CPU readback on offscreen canvas is fast)
-        const currId = work.getContext('2d').getImageData(0, 0, Wp, Hp);
-        const curr32 = new Uint32Array(currId.data.buffer);
-
-        // Build diff frame: unchanged pixels → DIFF_KEY32 (will be transparent)
-        const diffBuf = new Uint8ClampedArray(Wp * Hp * 4);
-        const diff32  = new Uint32Array(diffBuf.buffer);
-        for (let p = 0; p < curr32.length; p++) {
-          diff32[p] = curr32[p] === prevPx32[p] ? DIFF_KEY32 : curr32[p];
-        }
-        diffCanvas.width = Wp; diffCanvas.height = Hp;
-        diffCanvas.getContext('2d').putImageData(new ImageData(diffBuf, Wp, Hp), 0, 0);
-        gif.addFrame(diffCanvas, { delay: frameDelay, copy: true, transparent: DIFF_KEY });
-        prevPx32 = curr32; // curr32 shares ArrayBuffer with currId — safe to keep
-      } else {
-        // First frame (or transparent bg): always full frame, no transparency trick
-        gif.addFrame(work, { delay: frameDelay, copy: true });
-        if (!S.transparentBg) {
-          const id = work.getContext('2d').getImageData(0, 0, Wp, Hp);
-          prevPx32 = new Uint32Array(id.data.buffer);
-        }
-      }
-
+      gif.addFrame(work, { delay: frameDelay, copy: true });
       setProgress((i + 1) / total * 0.5);
       btn.textContent = `${i + 1}/${total}`;
       if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
@@ -2327,11 +2327,11 @@ document.getElementById('export-gif-btn').addEventListener('click', async () => 
   } catch(e) {
     console.error(e);
     alert(e.message || 'GIF Export 실패');
-    btn.textContent = 'GIF'; btn.style.opacity = '';
+    btn.textContent = 'Export'; btn.style.opacity = '';
     hideProgress();
     if (resumeAfter) startMotion();
   }
-});
+}
 
 // ── Export MP4 ─────────────────────────────────────
 // Strategy:
@@ -2448,11 +2448,6 @@ async function exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn) {
     width: Wp, height: Hp,
     framerate: fps,
     bitrate,
-    // VBR: encoder uses far fewer bits on simple frames (solid background,
-    // near-static areas) while spending up to `bitrate` on complex ones.
-    // Text animations compress dramatically with VBR — typically 40–60%
-    // smaller than the equivalent CBR at the same peak quality ceiling.
-    bitrateMode: 'variable',
     latencyMode: 'quality',
     ...(ext === 'mp4' ? { avc: { format: 'avc' } } : {}),
   });
@@ -2492,9 +2487,8 @@ async function exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn) {
   download(URL.createObjectURL(blob), `sticky_${Date.now()}.${ext}`);
 }
 
-document.getElementById('export-mp4-btn').addEventListener('click', async () => {
+async function runMp4Export(btn) {
   if (!S.motionOn) { alert('먼저 모션을 활성화(Play)해주세요.'); return; }
-  const btn = document.getElementById('export-mp4-btn');
   const dur = exportDuration;
   // Match preview frame rate (preview uses requestAnimationFrame = monitor refresh).
   // Min 60fps so older monitors still get smooth motion; cap at 120fps to keep
@@ -2516,7 +2510,7 @@ document.getElementById('export-mp4-btn').addEventListener('click', async () => 
     if (typeof VideoEncoder !== 'undefined') {
       await exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn);
       hideProgress();
-      btn.textContent = 'MP4'; btn.style.opacity = '';
+      btn.textContent = 'Export'; btn.style.opacity = '';
       if (resumeAfter) startMotion();
       return;
     }
@@ -2566,16 +2560,55 @@ document.getElementById('export-mp4-btn').addEventListener('click', async () => 
     const blob = new Blob(chunks, { type: mimeType.split(';')[0] });
     download(URL.createObjectURL(blob), `sticky_${Date.now()}.${ext}`);
     hideProgress();
-    btn.textContent = 'MP4'; btn.style.opacity = '';
+    btn.textContent = 'Export'; btn.style.opacity = '';
     if (resumeAfter) startMotion();
 
   } catch(e) {
     console.error(e);
     alert(e.message || 'MP4 Export 실패');
-    btn.textContent = 'MP4'; btn.style.opacity = '';
+    btn.textContent = 'Export'; btn.style.opacity = '';
     hideProgress();
     if (resumeAfter) startMotion();
   }
+}
+
+// ── Export: format tabs + scale selector + dispatch ───────────────────────
+let currentExportFormat = 'png';
+let exportScale = 3;
+
+// Tab switching: active tab → pane visibility
+document.querySelectorAll('#export-tabs [data-fmt]').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('#export-tabs [data-fmt]').forEach(b => b.classList.remove('on'));
+    tab.classList.add('on');
+    currentExportFormat = tab.dataset.fmt;
+    document.querySelectorAll('.export-pane').forEach(p => {
+      p.style.display = p.dataset.pane === currentExportFormat ? '' : 'none';
+    });
+    // GIF info: show the actual loop length so user knows what they'll get
+    if (currentExportFormat === 'gif') {
+      const period = getMotionLoopDuration(S.motionType, S.motionSpeed);
+      const info = document.getElementById('gif-loop-info');
+      if (info) info.textContent = `Auto loop · ${period.toFixed(2)}s · ${S.motionType}`;
+    }
+  });
+});
+
+// PNG scale pills (1× / 2× / 3× / 4×)
+document.querySelectorAll('[data-pane="png"] [data-scale]').forEach(p => {
+  p.addEventListener('click', () => {
+    document.querySelectorAll('[data-pane="png"] [data-scale]').forEach(b => b.classList.remove('on'));
+    p.classList.add('on');
+    exportScale = parseInt(p.dataset.scale);
+  });
+});
+
+// Single Export button → dispatch by current format
+document.getElementById('export-do-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('export-do-btn');
+  if (currentExportFormat === 'png')      await runPngExport(btn);
+  else if (currentExportFormat === 'gif') await runGifExport(btn);
+  else if (currentExportFormat === 'mp4') await runMp4Export(btn);
 });
 
 // ── Arch + Perspective bindings ────────────────────
