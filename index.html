@@ -1495,9 +1495,14 @@ function renderMotionFrame(rawT, easeInP = 1) {
 
     } else if (S.motionType === 'wave') {
       const p = Math.sin(phi * 0.5);
+      // Filter pulse synced to wave transform (both at freq 0.5). Previously
+      // used the outer `lerpT` (freq 0.7) which made wave a dual-frequency
+      // motion with a true period of 10s — preventing seamless GIF loops at
+      // any reasonable duration. Aligning to 0.5 yields a clean 2s period.
+      const wlerp = (p + 1) / 2;
       mot.sx = 1 + p*I*0.32; mot.sy=1; mot.x=p*I*6; mot.y=0; mot.r=0; mot.s=1;
       stickyText.style.letterSpacing = (S.kerning + p*I*0.09) + 'em';
-      applyFrameFilter(lerpT); compositeTransform();
+      applyFrameFilter(wlerp); compositeTransform();
 
     } else if (S.motionType === 'bubble') {
       mot.sx=1; mot.sy=1; mot.x=0; mot.y=0; mot.r=0; mot.s=1;
@@ -2249,22 +2254,35 @@ async function ensureGifWorker() {
 }
 
 // Per-motion natural cycle period (seconds) at motionSpeed = 1.
-// Derived directly from each motion's phase math in renderMotionFrame:
-//   phi = 2π·rawT·motionSpeed; sin/cos cycle when their argument advances 2π.
-// For per-character motions with mixed rates (bubble/melt/flex), pick the rate
-// that yields a visually clean loop (typically the dominant oscillation).
+// Derived directly from each motion's phase math in renderMotionFrame.
+//
+// PERIODIC motions — single base frequency, every variable returns to its
+// initial value at exactly `period`. Loop is mathematically seamless:
+//   breathe : sin(phi · 0.7),  filter at 0.7  → ≈1.43 s
+//   bump    : sin(phi · 0.5),  filter follows → 2 s
+//   wave    : sin(phi · 0.5),  filter sync'd  → 2 s   (after in-place fix)
+//   stretch : (phi · 0.42) %   → ≈2.38 s
+//
+// NON-PERIODIC motions — per-character mixed rates (bubble/melt) or
+// hash-randomised beats (flex). No clean LCM exists; we render a duration
+// that captures the motion's visual character, then mask the unavoidable
+// seam with a cross-fade (see runGifExport).
 function getMotionLoopDuration(type, speed) {
   const sp = Math.max(0.01, speed || 1);
   const periods = {
-    breathe: 1 / 0.7,    // sin(phi · 0.7)              ≈1.43 s
-    bump:    1 / 0.5,    // sin(phi · 0.5)              = 2 s
-    wave:    1 / 0.5,    // sin(phi · 0.5)              = 2 s
-    stretch: 1 / 0.42,   // (phi · 0.42) % 2π            ≈2.38 s
-    bubble:  1 / 0.6,    // dominant osc rate (r1 ≥ 0.6) ≈1.67 s
-    melt:    1 / 0.22,   // slowest drip rate            ≈4.55 s
-    flex:    0.55 * 4,   // 4 beats × 0.55 s/beat        = 2.2 s
+    breathe: 1 / 0.7,    // ≈1.43 s — periodic
+    bump:    1 / 0.5,    // 2 s     — periodic
+    wave:    1 / 0.5,    // 2 s     — periodic (filter freq fixed)
+    stretch: 1 / 0.42,   // ≈2.38 s — periodic
+    bubble:  4,          //          — non-periodic, blended
+    melt:    1 / 0.22,   // ≈4.55 s — non-periodic, blended
+    flex:    0.55 * 4,   // 2.2 s   — non-periodic, blended (4 beats)
   };
   return (periods[type] || 2) / sp;
+}
+
+function isMotionPeriodic(type) {
+  return type === 'breathe' || type === 'bump' || type === 'wave' || type === 'stretch';
 }
 
 async function runGifExport(btn) {
@@ -2309,16 +2327,97 @@ async function runGifExport(btn) {
 
     showProgress('Rendering frames…', 0);
     const work = document.createElement('canvas');
-    // Sample i = 0 .. total-1 across [0, period) so frame `total` would alias
-    // back to frame 0 — guarantees seamless loop without a duplicate end frame.
-    for (let i = 0; i < total; i++) {
-      const t = (i / total) * period;
-      renderMotionFrame(t, 1);
-      await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
-      gif.addFrame(work, { delay: frameDelay, copy: true });
-      setProgress((i + 1) / total * 0.5);
-      btn.textContent = `${i + 1}/${total}`;
-      if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+
+    // ── Loop-quality strategy ───────────────────────────────────────────
+    // Periodic motions return to their initial state exactly at `period` →
+    // straight render, no blending needed. Non-periodic motions (bubble /
+    // melt / flex) never align mathematically; we mask the seam by rendering
+    // `overlap` extra frames past the period and cross-fading them into the
+    // first `overlap` output frames.
+    //
+    //  Output frame[i] formula (for non-periodic):
+    //    i in [0, overlap)   : blend(rendered[i], rendered[total + i],
+    //                                alpha=(overlap - i)/overlap)
+    //    i in [overlap, total): rendered[i]
+    //
+    //  In playback the loop transition rendered[total-1] → output[0] is
+    //  rendered[total-1] → rendered[total] (motion continuation = smooth).
+    //  The blend then fades from "wrap-around" toward "natural start" over
+    //  the first overlap frames, hiding the discontinuity.
+    const periodic = isMotionPeriodic(S.motionType);
+    const overlap  = periodic ? 0 : Math.min(8, Math.max(3, Math.floor(total / 10)));
+
+    if (overlap === 0) {
+      // ── PERIODIC: simple sequential render ─────────────────────────────
+      for (let i = 0; i < total; i++) {
+        const t = (i / total) * period;
+        renderMotionFrame(t, 1);
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+        gif.addFrame(work, { delay: frameDelay, copy: true });
+        setProgress((i + 1) / total * 0.5);
+        btn.textContent = `${i + 1}/${total}`;
+        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+      }
+    } else {
+      // ── NON-PERIODIC: 3-phase render with cross-fade ───────────────────
+      const blendCanvas = document.createElement('canvas');
+      blendCanvas.width = Wp; blendCanvas.height = Hp;
+      const blendCtx = blendCanvas.getContext('2d');
+
+      // Linear pixel blend with auto-clamping via Uint8ClampedArray
+      const blend = (a, b, alpha) => {
+        const out = new ImageData(a.width, a.height);
+        const aD = a.data, bD = b.data, rD = out.data;
+        const inv = 1 - alpha;
+        for (let i = 0; i < aD.length; i++) rD[i] = aD[i] * inv + bD[i] * alpha;
+        return out;
+      };
+
+      const totalSteps = total + overlap; // for progress
+      let step = 0;
+
+      // Phase 1 — render first `overlap` frames into firstFrames[]
+      // (NOT yet added to gif; needed as blend targets)
+      const firstFrames = [];
+      for (let i = 0; i < overlap; i++) {
+        const t = (i / total) * period;
+        renderMotionFrame(t, 1);
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+        firstFrames.push(work.getContext('2d').getImageData(0, 0, Wp, Hp));
+        step++;
+        setProgress(step / totalSteps * 0.5);
+        btn.textContent = `${step}/${total}`;
+        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+      }
+
+      // Phase 2 — render wrap-around frames [total..total+overlap-1],
+      // blend with firstFrames[i], add as gif output frames 0..overlap-1
+      for (let i = 0; i < overlap; i++) {
+        const t = ((total + i) / total) * period;
+        renderMotionFrame(t, 1);
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+        const wrapData = work.getContext('2d').getImageData(0, 0, Wp, Hp);
+        const alpha = (overlap - i) / overlap; // 1 → 1/overlap
+        const blended = blend(firstFrames[i], wrapData, alpha);
+        blendCtx.putImageData(blended, 0, 0);
+        gif.addFrame(blendCanvas, { delay: frameDelay, copy: true });
+        step++;
+        setProgress(step / totalSteps * 0.5);
+        btn.textContent = `${step}/${total}`;
+        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+      }
+
+      // Phase 3 — render remaining frames [overlap..total-1] in order
+      for (let i = overlap; i < total; i++) {
+        const t = (i / total) * period;
+        renderMotionFrame(t, 1);
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+        gif.addFrame(work, { delay: frameDelay, copy: true });
+        step++;
+        setProgress(step / totalSteps * 0.5);
+        btn.textContent = `${step}/${total}`;
+        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+      }
     }
     btn.textContent = 'Encoding…';
     showProgress('Encoding GIF…', 0.5);
