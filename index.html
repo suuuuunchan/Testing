@@ -2201,22 +2201,17 @@ async function rasterizeFrameToCanvas(Wcss, Hcss, dpr, fontCSS, outCanvas) {
   const Wp = Math.round(Wcss * dpr);
   const Hp = Math.round(Hcss * dpr);
   const svg = buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS);
+  // createImageBitmap accepts a Blob directly — no URL.createObjectURL needed,
+  // no HTMLImageElement overhead, and the browser can decode off-thread.
   const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
-  const url = URL.createObjectURL(blob);
-  try {
-    const img = new Image();
-    img.decoding = 'sync';
-    img.src = url;
-    await img.decode();
-    const cv = outCanvas || document.createElement('canvas');
-    if (cv.width !== Wp || cv.height !== Hp) { cv.width = Wp; cv.height = Hp; }
-    const cx = cv.getContext('2d', { colorSpace: 'srgb' });
-    cx.clearRect(0, 0, Wp, Hp);
-    cx.drawImage(img, 0, 0, Wp, Hp);
-    return cv;
-  } finally {
-    URL.revokeObjectURL(url);
-  }
+  const bitmap = await createImageBitmap(blob);
+  const cv = outCanvas || document.createElement('canvas');
+  if (cv.width !== Wp || cv.height !== Hp) { cv.width = Wp; cv.height = Hp; }
+  const cx = cv.getContext('2d', { colorSpace: 'srgb' });
+  cx.clearRect(0, 0, Wp, Hp);
+  cx.drawImage(bitmap, 0, 0, Wp, Hp);
+  bitmap.close();
+  return cv;
 }
 
 function getExportSize() {
@@ -2366,42 +2361,38 @@ async function runGifExport(btn) {
         gif.addFrame(work, { delay: frameDelay, copy: true });
         setProgress((i + 1) / total * 0.5);
         btn.textContent = `${i + 1}/${total}`;
-        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
     } else {
       // ── NON-PERIODIC: 3-phase render with cross-fade ───────────────────
+      // GPU-compositing blend: no getImageData readbacks, no CPU pixel loop.
+      // Phase 1 stores frames as ImageBitmaps (GPU-resident). Phase 2 draws
+      // the wrap-around frame as an opaque base, then overlays the stored
+      // first-frame with globalAlpha = (1-alpha) — equivalent to linear mix:
+      //   output = wrapFrame * alpha + firstFrame * (1-alpha)
       const blendCanvas = document.createElement('canvas');
       blendCanvas.width = Wp; blendCanvas.height = Hp;
-      const blendCtx = blendCanvas.getContext('2d');
-
-      // Linear pixel blend with auto-clamping via Uint8ClampedArray
-      const blend = (a, b, alpha) => {
-        const out = new ImageData(a.width, a.height);
-        const aD = a.data, bD = b.data, rD = out.data;
-        const inv = 1 - alpha;
-        for (let i = 0; i < aD.length; i++) rD[i] = aD[i] * inv + bD[i] * alpha;
-        return out;
-      };
+      const blendCtx = blendCanvas.getContext('2d', { colorSpace: 'srgb' });
 
       const totalSteps = total + overlap; // for progress
       let step = 0;
 
-      // Phase 1 — render first `overlap` frames into firstFrames[]
-      // (NOT yet added to gif; needed as blend targets)
-      const firstFrames = [];
+      // Phase 1 — render first `overlap` frames, cache as GPU ImageBitmaps
+      // (NOT yet added to gif; used as blend targets in Phase 2)
+      const firstBitmaps = [];
       for (let i = 0; i < overlap; i++) {
         const t = (i / total) * period;
         renderMotionFrame(t, 1);
         await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
-        firstFrames.push(work.getContext('2d').getImageData(0, 0, Wp, Hp));
+        firstBitmaps.push(await createImageBitmap(work)); // GPU copy, no readback
         step++;
         setProgress(step / totalSteps * 0.5);
         btn.textContent = `${step}/${total}`;
-        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
 
       // Phase 2 — render wrap-around frames [total..total+overlap-1],
-      // blend with firstFrames[i], add as gif output frames 0..overlap-1.
+      // GPU-composite with firstBitmaps[i], add as gif output frames 0..overlap-1.
       //
       // alpha curve: cosine smoothstep from 1 → 0 across [0, overlap-1].
       //   - i = 0:           alpha = 1 (pure wrap-around)  → output = rendered[total]
@@ -2415,16 +2406,21 @@ async function runGifExport(btn) {
         const t = ((total + i) / total) * period;
         renderMotionFrame(t, 1);
         await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
-        const wrapData = work.getContext('2d').getImageData(0, 0, Wp, Hp);
         const alpha = (1 + Math.cos(Math.PI * (i / denom))) / 2; // 1 → 0, cosine
-        const blended = blend(firstFrames[i], wrapData, alpha);
-        blendCtx.putImageData(blended, 0, 0);
+        // GPU blend: draw wrapFrame opaque, then overlay firstBitmap at (1-alpha)
+        blendCtx.globalAlpha = 1;
+        blendCtx.drawImage(work, 0, 0);              // wrapFrame as opaque base
+        blendCtx.globalAlpha = 1 - alpha;            // firstFrame contribution
+        blendCtx.drawImage(firstBitmaps[i], 0, 0);
+        blendCtx.globalAlpha = 1;                    // reset
         gif.addFrame(blendCanvas, { delay: frameDelay, copy: true });
         step++;
         setProgress(step / totalSteps * 0.5);
         btn.textContent = `${step}/${total}`;
-        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
+      // Release GPU memory for stored first-frames
+      firstBitmaps.forEach(b => b.close());
 
       // Phase 3 — render remaining frames [overlap..total-1] in order
       for (let i = overlap; i < total; i++) {
@@ -2435,7 +2431,7 @@ async function runGifExport(btn) {
         step++;
         setProgress(step / totalSteps * 0.5);
         btn.textContent = `${step}/${total}`;
-        if (i % 4 === 3) await new Promise(r => setTimeout(r, 0));
+        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
     }
     btn.textContent = 'Encoding…';
