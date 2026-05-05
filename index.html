@@ -1512,9 +1512,15 @@ function renderMotionFrame(rawT, easeInP = 1) {
         const r1 = 0.6 + (i*0.37%1)*1.1;
         const r2 = 0.4 + (i*0.61%1)*1.3;
         const fq = 0.15 + (i*0.19%1)*0.18;
-        const osc1   = Math.sin(phi*r1 + i*1.1);
-        const osc2   = Math.sin(phi*r2 + i*2.3);
-        const floatY = Math.sin(phi*fq + i*0.9) * FL * 36;
+        // No constant phase offsets: at t=0 all oscillators are sin(0)=0 → every
+        // char starts at neutral (sx=1, skew=0°, floatY=0). Organic diversity comes
+        // from each char having its own frequency (r1/r2/fq), causing them to diverge
+        // immediately at different rates. The old i·1.1/i·2.3/i·0.9 offsets produced
+        // extreme initial states (e.g. char4: sx≈0.48, char2: skew≈−22°) that made
+        // the GIF first frame look severely distorted.
+        const osc1   = Math.sin(phi*r1);
+        const osc2   = Math.sin(phi*r2);
+        const floatY = Math.sin(phi*fq) * FL * 36;
         const sx   = 1 + osc1*I*0.55;
         const skew = osc2*I*22;
         const {x,y} = charOffsets[i];
@@ -1566,9 +1572,14 @@ function renderMotionFrame(rawT, easeInP = 1) {
         return 1 + (lEx + rEx) * 0.15;
       }
       const curActive = activeSet(beatIdx);
-      const prvActive = activeSet(beatIdx - 1);
+      // For the very first beat (beatIdx=0) treat the "previous beat" as fully
+      // neutral — empty active set, empty target map → getSx returns 1 for all
+      // chars. This ensures frame 0 (easeT=0, curSx=pSx) starts at sx=1 (no
+      // stretch) instead of the arbitrary hash-based end-state of beat −1, which
+      // could show chars severely stretched at the GIF loop start.
+      const prvActive = beatIdx > 0 ? activeSet(beatIdx - 1) : new Set();
       const curT = buildTargets(beatIdx, curActive);
-      const prvT = buildTargets(beatIdx - 1, prvActive);
+      const prvT = beatIdx > 0 ? buildTargets(beatIdx - 1, prvActive) : new Map();
 
       // Oblique on the wider of the two active chars (reuse already-built targets)
       const [oA, oB]   = [...curActive];
@@ -1602,9 +1613,13 @@ function renderMotionFrame(rawT, easeInP = 1) {
       // filter blurs more to merge neighbouring drips into gooey bridges.
       charEls.forEach((el, i) => {
         const rate   = 0.22 + (i * 0.31 % 1) * 0.28;          // 0.22–0.50 unique per char
-        const phase  = i * 1.57 + i * i * 0.09;
-        const drip   = Math.sin(phi * rate + phase);            // –1 → 1
-        const drip01 = (drip + 1) / 2;                         // 0 → 1
+        // Use -cos(φ·rate) = sin(φ·rate − π/2).
+        // At t=0: −cos(0) = −1 → drip01 = 0 → dropY=0, sx=1 (fully neutral).
+        // Old formula sin(φ·rate + phase_i) had phase_i = i·1.57 + i²·0.09,
+        // causing chars 1 and 4 to start at near-maximum droop (drip01≈1).
+        // Frequency diversity (rate∈[0.22,0.50] per char) still gives organic look.
+        const drip   = -Math.cos(phi * rate);                   // –1 → 1, starts at –1
+        const drip01 = (drip + 1) / 2;                         // 0 → 1, starts at 0
 
         const dropY = drip01 * I * 45;                          // max 45 px droop
         const sx    = 1 + drip01 * I * 0.40;                   // widens at bottom
@@ -2322,15 +2337,16 @@ function snapshotExportLayout() {
 // STRETCH  — cycle = (phi·0.42) mod 2π → exact sawtooth period.
 //            T = 1/(0.42·sp). ✓ (letterSpacing changes but is mod-locked)
 //
-// BUBBLE   — Three independent oscillators per char at irrational mutual
-//            ratios (r1∈[0.6,1.7], r2∈[0.4,1.7], fq∈[0.15,0.33]).
-//            True LCM period is infinite. Strategy: render one full cycle
-//            of the SLOWEST oscillator (fq_min = 0.15) so the dominant
-//            float motion loops cleanly; cross-fade masks the remaining seam.
+// BUBBLE   — Three independent oscillators per char, NO phase offsets (removed).
+//            All chars start at sin(0)=0 (neutral). Frequency diversity:
+//            r1∈[0.6,1.7], r2∈[0.4,1.7], fq∈[0.15,0.33] per char.
+//            True LCM period is infinite. Strategy: render one full cycle of
+//            the SLOWEST float oscillator (fq_min=0.15 → T≈6.67s) so char 0's
+//            float returns to 0; cross-fade masks seam for other chars.
 //
-// MELT     — Global kerning pulse at phi·0.18 (period≈5.56 s) is the most
-//            visually prominent component. Per-char drip rates 0.22..0.50
-//            have no clean LCM with kerning → cross-fade masks their seam.
+// MELT     — Uses −cos(φ·rate) so drip01=0 at t=0 (fully neutral).
+//            Global kerning pulse at phi·0.18 (period≈5.56s) is dominant.
+//            Per-char drip rates 0.22..0.50 have no clean LCM → cross-fade.
 //
 // FLEX     — beat duration = 0.55/sp, content determined by hash(beatIdx).
 //            Not periodic — each beat is hash-unique. 4 complete beats gives
@@ -3095,9 +3111,10 @@ function hpStartAnim(type) {
       hpText.style.transform = '';
       hpCharEls.forEach((el, i) => {
         const r1=0.6+(i*0.37%1)*1.1, r2=0.4+(i*0.61%1)*1.3;
-        const sx = 1 + Math.sin(phi*r1+i*1.1)*I*0.55;
-        const sk = Math.sin(phi*r2+i*2.3)*I*22;
-        const fy = Math.sin(phi*0.15+i*0.9)*I*18;
+        // No phase offsets — neutral start at t=0, diverge by frequency
+        const sx = 1 + Math.sin(phi*r1)*I*0.55;
+        const sk = Math.sin(phi*r2)*I*22;
+        const fy = Math.sin(phi*0.15)*I*18;
         el.style.transform = `translateY(${fy}px) scaleX(${sx}) skewX(${sk}deg)`;
       });
 
@@ -3132,8 +3149,10 @@ function hpStartAnim(type) {
         const lEx = (targets.get(i-1)??1)-1, rEx = (targets.get(i+1)??1)-1;
         return 1 + (lEx+rEx)*0.15;
       }
-      const hpCur = hpActiveSet(beatIdx), hpPrv = hpActiveSet(beatIdx-1);
-      const hpCurT = hpBuildT(beatIdx, hpCur), hpPrvT = hpBuildT(beatIdx-1, hpPrv);
+      const hpCur = hpActiveSet(beatIdx);
+      const hpPrv = beatIdx > 0 ? hpActiveSet(beatIdx-1) : new Set();
+      const hpCurT = hpBuildT(beatIdx, hpCur);
+      const hpPrvT = beatIdx > 0 ? hpBuildT(beatIdx-1, hpPrv) : new Map();
       const [hpA,hpB]=[...hpCur], hpObl = (hpCurT.get(hpA)??1)>=(hpCurT.get(hpB)??1)?hpA:hpB;
       const [hpPA,hpPB]=[...hpPrv], hpPrvObl = (hpPrvT.get(hpPA)??1)>=(hpPrvT.get(hpPB)??1)?hpPA:hpPB;
       hpCharEls.forEach((el, i) => {
@@ -3146,8 +3165,8 @@ function hpStartAnim(type) {
       hpText.style.transform = '';
       hpCharEls.forEach((el, i) => {
         const rate   = 0.22 + (i * 0.31 % 1) * 0.28;
-        const phase  = i * 1.57 + i * i * 0.09;
-        const drip01 = (Math.sin(phi * rate + phase) + 1) / 2;
+        // −cos(φ·rate): starts at −1 at t=0 → drip01=0 (neutral), no droop
+        const drip01 = (-Math.cos(phi * rate) + 1) / 2;
         const dropY  = drip01 * I * 32;
         const sx     = 1 + drip01 * I * 0.40;
         const sy     = 1 - drip01 * I * 0.14;
