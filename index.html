@@ -2270,13 +2270,20 @@ async function ensureGifWorker() {
 function getMotionLoopDuration(type, speed) {
   const sp = Math.max(0.01, speed || 1);
   const periods = {
-    breathe: 1 / 0.7,    // ≈1.43 s — periodic
-    bump:    1 / 0.5,    // 2 s     — periodic
-    wave:    1 / 0.5,    // 2 s     — periodic (filter freq fixed)
-    stretch: 1 / 0.42,   // ≈2.38 s — periodic
-    bubble:  4,          //          — non-periodic, blended
-    melt:    1 / 0.22,   // ≈4.55 s — non-periodic, blended
-    flex:    0.55 * 4,   // 2.2 s   — non-periodic, blended (4 beats)
+    // ── Periodic: every variable returns exactly to its initial value at T ──
+    breathe: 1 / 0.7,    // ≈1.43 s — single freq 0.7 (transform + filter)
+    bump:    1 / 0.5,    // 2 s     — single freq 0.5 (transform + filter)
+    wave:    1 / 0.5,    // 2 s     — single freq 0.5 after filter sync fix
+    stretch: 1 / 0.42,   // ≈2.38 s — single freq 0.42
+
+    // ── Non-periodic: choose the period that aligns the SLOWEST visible
+    //    component (the most prominent "drift" if misaligned). Other
+    //    components stay misaligned at the seam → cross-fade masks them.
+    bubble:  1 / 0.15,   // ≈6.67 s — slowest per-char float fq=0.15
+    melt:    1 / 0.18,   // ≈5.56 s — global kerning oscillator phi·0.18
+                         //           (drips per-char 0.22-0.50 stay blended)
+    flex:    0.55 * 4,   // 2.2 s   — 4 beats; beat content is hash-random
+                         //           per beatIdx so seam is irreducible
   };
   return (periods[type] || 2) / sp;
 }
@@ -2345,7 +2352,10 @@ async function runGifExport(btn) {
     //  The blend then fades from "wrap-around" toward "natural start" over
     //  the first overlap frames, hiding the discontinuity.
     const periodic = isMotionPeriodic(S.motionType);
-    const overlap  = periodic ? 0 : Math.min(8, Math.max(3, Math.floor(total / 10)));
+    // Wider blend region (~15% of loop, capped 8-24) gives cross-fade enough
+    // room to mask hash-random beat changes (flex) and per-char rate drift
+    // (bubble/melt) without creating visible ghosting.
+    const overlap  = periodic ? 0 : Math.min(24, Math.max(8, Math.floor(total * 0.15)));
 
     if (overlap === 0) {
       // ── PERIODIC: simple sequential render ─────────────────────────────
@@ -2391,13 +2401,22 @@ async function runGifExport(btn) {
       }
 
       // Phase 2 — render wrap-around frames [total..total+overlap-1],
-      // blend with firstFrames[i], add as gif output frames 0..overlap-1
+      // blend with firstFrames[i], add as gif output frames 0..overlap-1.
+      //
+      // alpha curve: cosine smoothstep from 1 → 0 across [0, overlap-1].
+      //   - i = 0:           alpha = 1 (pure wrap-around)  → output = rendered[total]
+      //   - i = overlap-1:   alpha = 0 (pure first frame)  → output = rendered[overlap-1]
+      // The endpoint alpha = 0 is critical: without it the last blend frame
+      // still carries a wrap-around residue that drops abruptly to 0 at the
+      // first non-blended frame, creating a visible micro-step at i=overlap.
+      // Cosine ease softens both ends of the blend curve for a natural fade.
+      const denom = Math.max(1, overlap - 1);
       for (let i = 0; i < overlap; i++) {
         const t = ((total + i) / total) * period;
         renderMotionFrame(t, 1);
         await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
         const wrapData = work.getContext('2d').getImageData(0, 0, Wp, Hp);
-        const alpha = (overlap - i) / overlap; // 1 → 1/overlap
+        const alpha = (1 + Math.cos(Math.PI * (i / denom))) / 2; // 1 → 0, cosine
         const blended = blend(firstFrames[i], wrapData, alpha);
         blendCtx.putImageData(blended, 0, 0);
         gif.addFrame(blendCanvas, { delay: frameDelay, copy: true });
@@ -2675,6 +2694,18 @@ async function runMp4Export(btn) {
 let currentExportFormat = 'png';
 let exportScale = 3;
 
+// Recompute the GIF info label from current motion state. Called when:
+//  (1) the GIF tab is activated, (2) motion type changes, (3) motion speed
+//  changes — so the displayed period stays in sync without an extra click.
+function updateGifLoopInfo() {
+  const info = document.getElementById('gif-loop-info');
+  if (!info) return;
+  // Always recompute even if pane is hidden — cheap, and avoids stale text
+  // when the user switches motions while GIF tab is inactive then re-opens.
+  const period = getMotionLoopDuration(S.motionType, S.motionSpeed);
+  info.textContent = `Auto loop · ${period.toFixed(2)}s · ${S.motionType}`;
+}
+
 // Tab switching: active tab → pane visibility
 document.querySelectorAll('#export-tabs [data-fmt]').forEach(tab => {
   tab.addEventListener('click', () => {
@@ -2684,14 +2715,25 @@ document.querySelectorAll('#export-tabs [data-fmt]').forEach(tab => {
     document.querySelectorAll('.export-pane').forEach(p => {
       p.style.display = p.dataset.pane === currentExportFormat ? '' : 'none';
     });
-    // GIF info: show the actual loop length so user knows what they'll get
-    if (currentExportFormat === 'gif') {
-      const period = getMotionLoopDuration(S.motionType, S.motionSpeed);
-      const info = document.getElementById('gif-loop-info');
-      if (info) info.textContent = `Auto loop · ${period.toFixed(2)}s · ${S.motionType}`;
-    }
+    if (currentExportFormat === 'gif') updateGifLoopInfo();
   });
 });
+
+// Live-sync the GIF loop info whenever motion type/speed change (regardless
+// of whether the GIF tab is currently visible — kept always up-to-date).
+document.getElementById('motion-type-grid').addEventListener('click', () => {
+  // Defer one tick so S.motionType is updated by the existing handler first
+  queueMicrotask(updateGifLoopInfo);
+});
+['motion-speed', 'motion-speed-val'].forEach(id => {
+  const el = document.getElementById(id);
+  if (!el) return;
+  el.addEventListener('input',  () => queueMicrotask(updateGifLoopInfo));
+  el.addEventListener('change', () => queueMicrotask(updateGifLoopInfo));
+});
+
+// Initial fill so the label isn't blank if the user opens GIF tab cold
+updateGifLoopInfo();
 
 // PNG scale pills (1× / 2× / 3× / 4×)
 document.querySelectorAll('[data-pane="png"] [data-scale]').forEach(p => {
