@@ -2100,7 +2100,11 @@ function escapeXML(s) {
 
 // Wcss/Hcss: CSS-pixel coordinate space (positions, font sizes, transforms)
 // Wp/Hp: physical pixel dimensions (SVG width/height attrs → render resolution)
-function buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS) {
+// layoutSnap: pre-computed char layout positions (optional, export fast path).
+//   When provided, skips the expensive DOM clear → reflow → restore cycle.
+//   Only valid for motions that do NOT change letterSpacing per frame
+//   (breathe, bump, bubble, flex). For wave/melt/stretch, pass null.
+function buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS, layoutSnap) {
   const W = Wcss, H = Hcss;
   const filterDefs = document.querySelector('#svg-filters defs').innerHTML;
 
@@ -2117,7 +2121,7 @@ function buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS) {
   // Delight/LibreBaskerville: baseline ≈ leading/2 + 0.78 × fontSize
   const baselineOffset = (lineHeightPx - fontSizePx) / 2 + fontSizePx * 0.78;
 
-  // ── Read layer CSS transform BEFORE clearing anything ──────────────
+  // ── Read layer CSS transform (changes every frame — must be fresh) ─
   const layerTransformStr = getComputedStyle(textTransformLayer).transform;
   const M_layer_raw = (layerTransformStr && layerTransformStr !== 'none')
     ? new DOMMatrix(layerTransformStr) : new DOMMatrix([1,0,0,1,0,0]);
@@ -2127,33 +2131,36 @@ function buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS) {
     .multiply(M_layer_raw)
     .multiply(new DOMMatrix([1,0,0,1, -W/2, -H/2]));
 
-  // ── Snapshot per-char transforms BEFORE clearing ──────────────────
+  // ── Snapshot per-char transforms (change every frame — must be fresh) ─
   const savedCharTransforms = charEls.map(el => el.style.transform || '');
 
-  // ── Temporarily clear ALL transforms to read pure layout positions ─
+  // ── Layout positions ────────────────────────────────────────────────
   // CSS transforms don't affect layout, but getBoundingClientRect is unreliable
   // when ancestor transforms are active (flexbox centering offsets can be masked).
-  // Clearing transforms then measuring gives the true layout position.
-  const savedLayerTransform = textTransformLayer.style.transform;
-  textTransformLayer.style.transform = 'none';
-  charEls.forEach(el => { el.style.transform = ''; });
-  void stickyText.offsetWidth; // force synchronous layout
+  // The snapshot path avoids two forced synchronous layouts (±2ms each) per frame.
+  let layoutPos;
+  if (layoutSnap) {
+    // Fast path: positions pre-computed once before export loop
+    layoutPos = layoutSnap;
+  } else {
+    // Slow path: clear transforms → force layout → measure → restore
+    const savedLayerTransform = textTransformLayer.style.transform;
+    textTransformLayer.style.transform = 'none';
+    charEls.forEach(el => { el.style.transform = ''; });
+    void stickyText.offsetWidth; // force synchronous layout
 
-  const wrapRect = canvasWrap.getBoundingClientRect();
-  const layoutPos = charEls.map(el => {
-    const r = el.getBoundingClientRect();
-    return {
-      x: r.left - wrapRect.left,
-      y: r.top  - wrapRect.top,
-      w: el.offsetWidth,
-      h: el.offsetHeight,
-    };
-  });
+    const wrapRect = canvasWrap.getBoundingClientRect();
+    layoutPos = charEls.map(el => {
+      const r = el.getBoundingClientRect();
+      return { x: r.left - wrapRect.left, y: r.top - wrapRect.top,
+               w: el.offsetWidth, h: el.offsetHeight };
+    });
 
-  // ── Restore transforms (sync, no repaint before next frame) ───────
-  textTransformLayer.style.transform = savedLayerTransform;
-  charEls.forEach((el, i) => { el.style.transform = savedCharTransforms[i]; });
-  void stickyText.offsetWidth;
+    // Restore transforms (sync, no repaint before next frame)
+    textTransformLayer.style.transform = savedLayerTransform;
+    charEls.forEach((el, i) => { el.style.transform = savedCharTransforms[i]; });
+    void stickyText.offsetWidth;
+  }
 
   // ── Build per-char SVG elements using composed DOMMatrix ──────────
   // For char i at layout position (x,y,w,h) with its own CSS transform M_char
@@ -2197,21 +2204,31 @@ ${parts.join('\n')}
 
 // buildFrameSVG uses CSS-px coordinate system (Wcss × Hcss) but renders at
 // physical pixel resolution (Wcss*dpr × Hcss*dpr) via SVG width/height vs viewBox.
-async function rasterizeFrameToCanvas(Wcss, Hcss, dpr, fontCSS, outCanvas) {
+// layoutSnap: optional pre-computed char positions (see buildFrameSVG for details).
+//
+// NOTE: createImageBitmap(svgBlob) is NOT used here because Chrome rejects SVG
+// blobs that contain embedded data: URI @font-face sources in that decode path.
+// new Image() + img.decode() via a blob URL is the reliable cross-browser method.
+async function rasterizeFrameToCanvas(Wcss, Hcss, dpr, fontCSS, outCanvas, layoutSnap) {
   const Wp = Math.round(Wcss * dpr);
   const Hp = Math.round(Hcss * dpr);
-  const svg = buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS);
-  // createImageBitmap accepts a Blob directly — no URL.createObjectURL needed,
-  // no HTMLImageElement overhead, and the browser can decode off-thread.
+  const svg = buildFrameSVG(Wcss, Hcss, Wp, Hp, fontCSS, layoutSnap);
   const blob = new Blob([svg], { type: 'image/svg+xml;charset=utf-8' });
-  const bitmap = await createImageBitmap(blob);
-  const cv = outCanvas || document.createElement('canvas');
-  if (cv.width !== Wp || cv.height !== Hp) { cv.width = Wp; cv.height = Hp; }
-  const cx = cv.getContext('2d', { colorSpace: 'srgb' });
-  cx.clearRect(0, 0, Wp, Hp);
-  cx.drawImage(bitmap, 0, 0, Wp, Hp);
-  bitmap.close();
-  return cv;
+  const url = URL.createObjectURL(blob);
+  try {
+    const img = new Image();
+    img.decoding = 'sync';
+    img.src = url;
+    await img.decode();
+    const cv = outCanvas || document.createElement('canvas');
+    if (cv.width !== Wp || cv.height !== Hp) { cv.width = Wp; cv.height = Hp; }
+    const cx = cv.getContext('2d', { colorSpace: 'srgb' });
+    cx.clearRect(0, 0, Wp, Hp);
+    cx.drawImage(img, 0, 0, Wp, Hp);
+    return cv;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
 }
 
 function getExportSize() {
@@ -2248,43 +2265,99 @@ async function ensureGifWorker() {
   return _gifWorkerUrl;
 }
 
-// Per-motion natural cycle period (seconds) at motionSpeed = 1.
-// Derived directly from each motion's phase math in renderMotionFrame.
+// ── Layout snapshot for export fast path ───────────────────────────────────
+// Takes a one-time measurement of char layout positions (with all transforms
+// cleared) so buildFrameSVG can skip the expensive DOM reflow on every frame.
 //
-// PERIODIC motions — single base frequency, every variable returns to its
-// initial value at exactly `period`. Loop is mathematically seamless:
-//   breathe : sin(phi · 0.7),  filter at 0.7  → ≈1.43 s
-//   bump    : sin(phi · 0.5),  filter follows → 2 s
-//   wave    : sin(phi · 0.5),  filter sync'd  → 2 s   (after in-place fix)
-//   stretch : (phi · 0.42) %   → ≈2.38 s
+// ONLY valid for motions that do NOT mutate letterSpacing per frame:
+//   breathe — stickyText.style.letterSpacing = S.kerning (constant) ✓
+//   bump    — stickyText.style.letterSpacing = S.kerning (constant) ✓
+//   bubble  — stickyText.style.letterSpacing = S.kerning (constant) ✓
+//   flex    — stickyText.style.letterSpacing = S.kerning (constant) ✓
 //
-// NON-PERIODIC motions — per-character mixed rates (bubble/melt) or
-// hash-randomised beats (flex). No clean LCM exists; we render a duration
-// that captures the motion's visual character, then mask the unavoidable
-// seam with a cross-fade (see runGifExport).
+// These motions change letterSpacing every frame → must NOT use snapshot:
+//   wave    — kerning ± p·I·0.09 em (shifts all char x-positions)
+//   melt    — kerning ± kOsc·I·0.07 em
+//   stretch — kerning − pullT·I·0.05 em (in stretch phase only)
+function snapshotExportLayout() {
+  const savedLayerTransform = textTransformLayer.style.transform;
+  const savedCharTransforms = charEls.map(el => el.style.transform || '');
+
+  textTransformLayer.style.transform = 'none';
+  charEls.forEach(el => { el.style.transform = ''; });
+  void stickyText.offsetWidth; // one forced synchronous layout
+
+  const wrapRect = canvasWrap.getBoundingClientRect();
+  const snap = charEls.map(el => {
+    const r = el.getBoundingClientRect();
+    return { x: r.left - wrapRect.left, y: r.top - wrapRect.top,
+             w: el.offsetWidth, h: el.offsetHeight };
+  });
+
+  textTransformLayer.style.transform = savedLayerTransform;
+  charEls.forEach((el, i) => { el.style.transform = savedCharTransforms[i]; });
+  void stickyText.offsetWidth;
+
+  return snap;
+}
+
+// ── Per-motion precise period analysis ─────────────────────────────────────
+//
+// Each motion uses phi = rawT · motionSpeed · 2π. "Periodic" means EVERY
+// animated variable (transform, filter, letterSpacing) shares ONE base
+// frequency and returns to its exact t=0 state after exactly one period T.
+//
+// BREATHE  — osc = sin(phi·0.7). All vars depend only on sin(phi·0.7).
+//            T = 1/(0.7·sp). Loop is mathematically exact. ✓
+//
+// BUMP ltr — phaseFrac = (phi·0.5 mod 2π)/(2π). Peaks travel L→R then wrap.
+//            sin(phi·0.5+const) filter follows same freq. T = 1/(0.5·sp). ✓
+//
+// BUMP rnd — sin(phi·0.5 + hash_i·2π). All chars at same base freq 0.5.
+//            T = 1/(0.5·sp). ✓
+//
+// WAVE     — p = sin(phi·0.5). Every animated var (sx, x, kerning, filter)
+//            derived only from p. T = 1/(0.5·sp). ✓
+//
+// STRETCH  — cycle = (phi·0.42) mod 2π → exact sawtooth period.
+//            T = 1/(0.42·sp). ✓ (letterSpacing changes but is mod-locked)
+//
+// BUBBLE   — Three independent oscillators per char at irrational mutual
+//            ratios (r1∈[0.6,1.7], r2∈[0.4,1.7], fq∈[0.15,0.33]).
+//            True LCM period is infinite. Strategy: render one full cycle
+//            of the SLOWEST oscillator (fq_min = 0.15) so the dominant
+//            float motion loops cleanly; cross-fade masks the remaining seam.
+//
+// MELT     — Global kerning pulse at phi·0.18 (period≈5.56 s) is the most
+//            visually prominent component. Per-char drip rates 0.22..0.50
+//            have no clean LCM with kerning → cross-fade masks their seam.
+//
+// FLEX     — beat duration = 0.55/sp, content determined by hash(beatIdx).
+//            Not periodic — each beat is hash-unique. 4 complete beats gives
+//            a good visual loop; cross-fade bridges the hash discontinuity.
 function getMotionLoopDuration(type, speed) {
   const sp = Math.max(0.01, speed || 1);
   const periods = {
-    // ── Periodic: every variable returns exactly to its initial value at T ──
-    breathe: 1 / 0.7,    // ≈1.43 s — single freq 0.7 (transform + filter)
-    bump:    1 / 0.5,    // 2 s     — single freq 0.5 (transform + filter)
-    wave:    1 / 0.5,    // 2 s     — single freq 0.5 after filter sync fix
-    stretch: 1 / 0.42,   // ≈2.38 s — single freq 0.42
-
-    // ── Non-periodic: choose the period that aligns the SLOWEST visible
-    //    component (the most prominent "drift" if misaligned). Other
-    //    components stay misaligned at the seam → cross-fade masks them.
-    bubble:  1 / 0.15,   // ≈6.67 s — slowest per-char float fq=0.15
-    melt:    1 / 0.18,   // ≈5.56 s — global kerning oscillator phi·0.18
-                         //           (drips per-char 0.22-0.50 stay blended)
-    flex:    0.55 * 4,   // 2.2 s   — 4 beats; beat content is hash-random
-                         //           per beatIdx so seam is irreducible
+    breathe: 1 / 0.7,    // ≈1.43 s — exact single-freq period
+    bump:    1 / 0.5,    // 2 s     — exact single-freq period
+    wave:    1 / 0.5,    // 2 s     — exact single-freq period
+    stretch: 1 / 0.42,   // ≈2.38 s — exact sawtooth period (mod-locked)
+    bubble:  1 / 0.15,   // ≈6.67 s — slowest float osc; cross-fade masks rest
+    melt:    1 / 0.18,   // ≈5.56 s — dominant kerning osc; cross-fade masks drips
+    flex:    0.55 * 4,   // 2.2 s   — 4 complete beats; cross-fade masks hash seam
   };
   return (periods[type] || 2) / sp;
 }
 
+// Periodic = every animated variable returns EXACTLY to t=0 state → no blend needed.
+// Non-periodic = irreducible phase drift at the seam → requires cross-fade.
 function isMotionPeriodic(type) {
   return type === 'breathe' || type === 'bump' || type === 'wave' || type === 'stretch';
+}
+
+// Motions that mutate letterSpacing per frame — layout snapshot is not valid.
+function motionChangesLayout(type) {
+  return type === 'wave' || type === 'melt' || type === 'stretch';
 }
 
 async function runGifExport(btn) {
@@ -2312,6 +2385,12 @@ async function runGifExport(btn) {
     resumeAfter = !!animFrame;
     if (resumeAfter) stopMotion();
 
+    // One-time layout snapshot eliminates per-frame DOM reflows for motions
+    // where letterSpacing stays constant (breathe/bump/bubble/flex).
+    // Wave/melt/stretch change letterSpacing → char positions shift per frame
+    // → those must keep the per-frame clear/measure/restore cycle (layoutSnap=null).
+    const layoutSnap = motionChangesLayout(S.motionType) ? null : snapshotExportLayout();
+
     const workers = Math.min(navigator.hardwareConcurrency || 4, 8);
     const gif = new GIF({ workerScript: workerUrl, workers, quality: 5, width: Wp, height: Hp, dither: false });
     gif.on('progress', pct => showProgress('Encoding GIF…', 0.5 + pct * 0.5));
@@ -2331,102 +2410,96 @@ async function runGifExport(btn) {
     const work = document.createElement('canvas');
 
     // ── Loop-quality strategy ───────────────────────────────────────────
-    // Periodic motions return to their initial state exactly at `period` →
-    // straight render, no blending needed. Non-periodic motions (bubble /
-    // melt / flex) never align mathematically; we mask the seam by rendering
-    // `overlap` extra frames past the period and cross-fading them into the
-    // first `overlap` output frames.
+    // Periodic motions (breathe/bump/wave/stretch) return to their exact initial
+    // state at the end of one period → straight render, no blending needed.
+    // Non-periodic motions (bubble/melt/flex) have irreducible phase drift at
+    // the seam → render `overlap` extra frames past the period, then cross-fade
+    // them into the first `overlap` output frames via GPU compositing.
     //
-    //  Output frame[i] formula (for non-periodic):
-    //    i in [0, overlap)   : blend(rendered[i], rendered[total + i],
-    //                                alpha=(overlap - i)/overlap)
-    //    i in [overlap, total): rendered[i]
+    //  Output frame[i] (non-periodic):
+    //    i ∈ [0, overlap)   → blend(firstFrame[i], wrapFrame[i], α_i)
+    //    i ∈ [overlap, total) → firstFrame[i] rendered directly
     //
-    //  In playback the loop transition rendered[total-1] → output[0] is
-    //  rendered[total-1] → rendered[total] (motion continuation = smooth).
-    //  The blend then fades from "wrap-around" toward "natural start" over
-    //  the first overlap frames, hiding the discontinuity.
+    //  Playback: frame[total-1] → frame[0]. At frame[total-1] the motion state
+    //  matches what would come next (wrapFrame[0]), so the transition is smooth.
+    //  Cross-fade then fades from wrap-around toward natural start over `overlap`
+    //  frames, hiding the discontinuity.
     const periodic = isMotionPeriodic(S.motionType);
-    // Wider blend region (~15% of loop, capped 8-24) gives cross-fade enough
-    // room to mask hash-random beat changes (flex) and per-char rate drift
-    // (bubble/melt) without creating visible ghosting.
-    const overlap  = periodic ? 0 : Math.min(24, Math.max(8, Math.floor(total * 0.15)));
+    // 15% of loop duration, capped 8–24 frames. Enough to mask hash-random beat
+    // changes (flex) and per-char rate drift (bubble/melt) without ghosting.
+    const overlap = periodic ? 0 : Math.min(24, Math.max(8, Math.floor(total * 0.15)));
 
     if (overlap === 0) {
-      // ── PERIODIC: simple sequential render ─────────────────────────────
+      // ── PERIODIC: mathematically exact loop, simple sequential render ──
       for (let i = 0; i < total; i++) {
         const t = (i / total) * period;
         renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
         gif.addFrame(work, { delay: frameDelay, copy: true });
         setProgress((i + 1) / total * 0.5);
         btn.textContent = `${i + 1}/${total}`;
         if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
     } else {
-      // ── NON-PERIODIC: 3-phase render with cross-fade ───────────────────
-      // GPU-compositing blend: no getImageData readbacks, no CPU pixel loop.
-      // Phase 1 stores frames as ImageBitmaps (GPU-resident). Phase 2 draws
-      // the wrap-around frame as an opaque base, then overlays the stored
-      // first-frame with globalAlpha = (1-alpha) — equivalent to linear mix:
-      //   output = wrapFrame * alpha + firstFrame * (1-alpha)
+      // ── NON-PERIODIC: 3-phase render with GPU cross-fade ───────────────
+      // GPU compositing avoids getImageData CPU readbacks and pixel-loop allocation.
+      // Phase 1 caches first `overlap` frames as ImageBitmaps (GPU-resident,
+      // closeable). Phase 2 uses globalAlpha drawImage for the blend:
+      //   result = wrapFrame (opaque base) + firstBitmap at globalAlpha=(1-α)
+      //          = wrapFrame·α + firstFrame·(1-α)   ← linear blend for opaque src
       const blendCanvas = document.createElement('canvas');
       blendCanvas.width = Wp; blendCanvas.height = Hp;
       const blendCtx = blendCanvas.getContext('2d', { colorSpace: 'srgb' });
 
-      const totalSteps = total + overlap; // for progress
+      const totalSteps = total + overlap;
       let step = 0;
 
-      // Phase 1 — render first `overlap` frames, cache as GPU ImageBitmaps
-      // (NOT yet added to gif; used as blend targets in Phase 2)
+      // Phase 1 — render first `overlap` frames, store as GPU ImageBitmaps.
+      // Not added to gif yet; used as blend targets in Phase 2.
       const firstBitmaps = [];
       for (let i = 0; i < overlap; i++) {
         const t = (i / total) * period;
         renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
-        firstBitmaps.push(await createImageBitmap(work)); // GPU copy, no readback
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
+        firstBitmaps.push(await createImageBitmap(work)); // GPU copy, no CPU readback
         step++;
         setProgress(step / totalSteps * 0.5);
         btn.textContent = `${step}/${total}`;
         if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
 
-      // Phase 2 — render wrap-around frames [total..total+overlap-1],
-      // GPU-composite with firstBitmaps[i], add as gif output frames 0..overlap-1.
+      // Phase 2 — render wrap-around frames [total..total+overlap-1], GPU-blend
+      // with firstBitmaps[i], emit as output frames 0..overlap-1.
       //
-      // alpha curve: cosine smoothstep from 1 → 0 across [0, overlap-1].
-      //   - i = 0:           alpha = 1 (pure wrap-around)  → output = rendered[total]
-      //   - i = overlap-1:   alpha = 0 (pure first frame)  → output = rendered[overlap-1]
-      // The endpoint alpha = 0 is critical: without it the last blend frame
-      // still carries a wrap-around residue that drops abruptly to 0 at the
-      // first non-blended frame, creating a visible micro-step at i=overlap.
-      // Cosine ease softens both ends of the blend curve for a natural fade.
+      // α curve: cosine smoothstep 1→0 over [0, overlap-1]:
+      //   i=0        → α=1 (pure wrap-around: motion continuity at loop point)
+      //   i=overlap-1 → α=0 (pure firstFrame: matches the un-blended frame[overlap])
+      // α=0 at the last blend frame is critical — avoids a micro-step discontinuity
+      // at the boundary between blended and un-blended output frames.
       const denom = Math.max(1, overlap - 1);
       for (let i = 0; i < overlap; i++) {
         const t = ((total + i) / total) * period;
         renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
-        const alpha = (1 + Math.cos(Math.PI * (i / denom))) / 2; // 1 → 0, cosine
-        // GPU blend: draw wrapFrame opaque, then overlay firstBitmap at (1-alpha)
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
+        const alpha = (1 + Math.cos(Math.PI * (i / denom))) / 2; // cosine 1→0
         blendCtx.globalAlpha = 1;
-        blendCtx.drawImage(work, 0, 0);              // wrapFrame as opaque base
-        blendCtx.globalAlpha = 1 - alpha;            // firstFrame contribution
+        blendCtx.drawImage(work, 0, 0);           // wrapFrame as opaque base
+        blendCtx.globalAlpha = 1 - alpha;         // firstFrame contribution on top
         blendCtx.drawImage(firstBitmaps[i], 0, 0);
-        blendCtx.globalAlpha = 1;                    // reset
+        blendCtx.globalAlpha = 1;
         gif.addFrame(blendCanvas, { delay: frameDelay, copy: true });
         step++;
         setProgress(step / totalSteps * 0.5);
         btn.textContent = `${step}/${total}`;
         if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
       }
-      // Release GPU memory for stored first-frames
-      firstBitmaps.forEach(b => b.close());
+      firstBitmaps.forEach(b => b.close()); // free GPU memory
 
-      // Phase 3 — render remaining frames [overlap..total-1] in order
+      // Phase 3 — remaining frames [overlap..total-1] rendered directly
       for (let i = overlap; i < total; i++) {
         const t = (i / total) * period;
         renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
         gif.addFrame(work, { delay: frameDelay, copy: true });
         step++;
         setProgress(step / totalSteps * 0.5);
@@ -2569,12 +2642,15 @@ async function exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn) {
   const work = document.createElement('canvas');
   work.width = Wp; work.height = Hp;
 
+  // Layout snapshot: skip per-frame DOM reflows for constant-letterSpacing motions
+  const layoutSnap = motionChangesLayout(S.motionType) ? null : snapshotExportLayout();
+
   // Keyframe every 1s for reasonable seekability without bloating bitrate
   const keyEvery = fps;
 
   for (let i = 0; i < total; i++) {
     renderMotionFrame(i / fps, 1);
-    await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+    await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
     const bitmap = await createImageBitmap(work);
     const frame = new VideoFrame(bitmap, {
       timestamp: i * frameDurationUs,
@@ -2588,7 +2664,7 @@ async function exportMP4_webcodecs(W, H, dpr, fps, total, fontCSS, btn) {
     // Throttle queue depth so encoder doesn't fall too far behind (memory)
     if (encoder.encodeQueueSize > 8) {
       await new Promise(r => setTimeout(r, 0));
-    } else if (i % 4 === 3) {
+    } else if (i % 8 === 7) {
       await new Promise(r => setTimeout(r, 0));
     }
   }
@@ -2652,12 +2728,14 @@ async function runMp4Export(btn) {
     const work = document.createElement('canvas');
     work.width = Wp; work.height = Hp;
 
+    const layoutSnap = motionChangesLayout(S.motionType) ? null : snapshotExportLayout();
+
     recorder.start(100);
     const recStart = performance.now();
 
     for (let i = 0; i < total; i++) {
       renderMotionFrame(i / fps, 1);
-      await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work);
+      await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
       oCtx.clearRect(0, 0, Wp, Hp);
       oCtx.drawImage(work, 0, 0);
       setProgress((i + 1) / total);
