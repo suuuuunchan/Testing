@@ -1512,15 +1512,15 @@ function renderMotionFrame(rawT, easeInP = 1) {
         const r1 = 0.6 + (i*0.37%1)*1.1;
         const r2 = 0.4 + (i*0.61%1)*1.3;
         const fq = 0.15 + (i*0.19%1)*0.18;
-        // No constant phase offsets: at t=0 all oscillators are sin(0)=0 → every
-        // char starts at neutral (sx=1, skew=0°, floatY=0). Organic diversity comes
-        // from each char having its own frequency (r1/r2/fq), causing them to diverge
-        // immediately at different rates. The old i·1.1/i·2.3/i·0.9 offsets produced
-        // extreme initial states (e.g. char4: sx≈0.48, char2: skew≈−22°) that made
-        // the GIF first frame look severely distorted.
-        const osc1   = Math.sin(phi*r1);
-        const osc2   = Math.sin(phi*r2);
-        const floatY = Math.sin(phi*fq) * FL * 36;
+        // Bounded phase offsets: sin(i·k)·0.5 keeps |offset|≤0.48 rad so frame-0
+        // never hits a hard extreme, while each char starts mid-animation (never
+        // neutral-simultaneously). Three different multipliers give organic spread.
+        const ph1    = Math.sin(i * 2.4) * 0.5;
+        const ph2    = Math.sin(i * 1.7 + 1.1) * 0.5;
+        const phY    = Math.sin(i * 3.1 + 0.7) * 0.5;
+        const osc1   = Math.sin(phi*r1 + ph1);
+        const osc2   = Math.sin(phi*r2 + ph2);
+        const floatY = Math.sin(phi*fq + phY) * FL * 36;
         const sx   = 1 + osc1*I*0.55;
         const skew = osc2*I*22;
         const {x,y} = charOffsets[i];
@@ -1577,9 +1577,9 @@ function renderMotionFrame(rawT, easeInP = 1) {
       // chars. This ensures frame 0 (easeT=0, curSx=pSx) starts at sx=1 (no
       // stretch) instead of the arbitrary hash-based end-state of beat −1, which
       // could show chars severely stretched at the GIF loop start.
-      const prvActive = beatIdx > 0 ? activeSet(beatIdx - 1) : new Set();
+      const prvActive = activeSet(beatIdx - 1);
       const curT = buildTargets(beatIdx, curActive);
-      const prvT = beatIdx > 0 ? buildTargets(beatIdx - 1, prvActive) : new Map();
+      const prvT = buildTargets(beatIdx - 1, prvActive);
 
       // Oblique on the wider of the two active chars (reuse already-built targets)
       const [oA, oB]   = [...curActive];
@@ -1613,13 +1613,11 @@ function renderMotionFrame(rawT, easeInP = 1) {
       // filter blurs more to merge neighbouring drips into gooey bridges.
       charEls.forEach((el, i) => {
         const rate   = 0.22 + (i * 0.31 % 1) * 0.28;          // 0.22–0.50 unique per char
-        // Use -cos(φ·rate) = sin(φ·rate − π/2).
-        // At t=0: −cos(0) = −1 → drip01 = 0 → dropY=0, sx=1 (fully neutral).
-        // Old formula sin(φ·rate + phase_i) had phase_i = i·1.57 + i²·0.09,
-        // causing chars 1 and 4 to start at near-maximum droop (drip01≈1).
-        // Frequency diversity (rate∈[0.22,0.50] per char) still gives organic look.
-        const drip   = -Math.cos(phi * rate);                   // –1 → 1, starts at –1
-        const drip01 = (drip + 1) / 2;                         // 0 → 1, starts at 0
+        // Per-char phase offset i·0.4 spreads chars across different drip stages
+        // at t=0 (drip01 ≈ [0, 0.04, 0.15, 0.32, 0.48] for 5 chars) so the
+        // animation always looks in-progress — no simultaneous neutral reset.
+        const drip   = -Math.cos(phi * rate + i * 0.4);        // –1 → 1, spread per char
+        const drip01 = (drip + 1) / 2;                         // 0 → 1
 
         const dropY = drip01 * I * 45;                          // max 45 px droop
         const sx    = 1 + drip01 * I * 0.40;                   // widens at bottom
@@ -3111,10 +3109,13 @@ function hpStartAnim(type) {
       hpText.style.transform = '';
       hpCharEls.forEach((el, i) => {
         const r1=0.6+(i*0.37%1)*1.1, r2=0.4+(i*0.61%1)*1.3;
-        // No phase offsets — neutral start at t=0, diverge by frequency
-        const sx = 1 + Math.sin(phi*r1)*I*0.55;
-        const sk = Math.sin(phi*r2)*I*22;
-        const fy = Math.sin(phi*0.15)*I*18;
+        // Bounded phase offsets — same constants as main render
+        const ph1 = Math.sin(i * 2.4) * 0.5;
+        const ph2 = Math.sin(i * 1.7 + 1.1) * 0.5;
+        const phY = Math.sin(i * 3.1 + 0.7) * 0.5;
+        const sx = 1 + Math.sin(phi*r1 + ph1)*I*0.55;
+        const sk = Math.sin(phi*r2 + ph2)*I*22;
+        const fy = Math.sin(phi*0.15 + phY)*I*18;
         el.style.transform = `translateY(${fy}px) scaleX(${sx}) skewX(${sk}deg)`;
       });
 
@@ -3150,9 +3151,9 @@ function hpStartAnim(type) {
         return 1 + (lEx+rEx)*0.15;
       }
       const hpCur = hpActiveSet(beatIdx);
-      const hpPrv = beatIdx > 0 ? hpActiveSet(beatIdx-1) : new Set();
+      const hpPrv = hpActiveSet(beatIdx-1);
       const hpCurT = hpBuildT(beatIdx, hpCur);
-      const hpPrvT = beatIdx > 0 ? hpBuildT(beatIdx-1, hpPrv) : new Map();
+      const hpPrvT = hpBuildT(beatIdx-1, hpPrv);
       const [hpA,hpB]=[...hpCur], hpObl = (hpCurT.get(hpA)??1)>=(hpCurT.get(hpB)??1)?hpA:hpB;
       const [hpPA,hpPB]=[...hpPrv], hpPrvObl = (hpPrvT.get(hpPA)??1)>=(hpPrvT.get(hpPB)??1)?hpPA:hpPB;
       hpCharEls.forEach((el, i) => {
@@ -3165,8 +3166,8 @@ function hpStartAnim(type) {
       hpText.style.transform = '';
       hpCharEls.forEach((el, i) => {
         const rate   = 0.22 + (i * 0.31 % 1) * 0.28;
-        // −cos(φ·rate): starts at −1 at t=0 → drip01=0 (neutral), no droop
-        const drip01 = (-Math.cos(phi * rate) + 1) / 2;
+        // Per-char phase offset — same i·0.4 spread as main render
+        const drip01 = (-Math.cos(phi * rate + i * 0.4) + 1) / 2;
         const dropY  = drip01 * I * 32;
         const sx     = 1 + drip01 * I * 0.40;
         const sy     = 1 - drip01 * I * 0.14;
