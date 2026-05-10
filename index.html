@@ -2251,15 +2251,57 @@ function getExportSize() {
 }
 
 // ── Export PNG ─────────────────────────────────────
+// PNG pHYs chunk injection — embeds 300 DPI physical resolution metadata so
+// design/print apps (Photoshop, Illustrator, Word, Affinity) interpret the
+// image at 300 dpi instead of the default 72 dpi. Pixel data is unchanged;
+// only the declared physical size shrinks (e.g. a 3000-px-wide PNG becomes
+// 10 inches @ 300 dpi instead of 41.7 inches @ 72 dpi).
+const _PNG_CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function _pngCrc32(bytes) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < bytes.length; i++) c = _PNG_CRC_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+async function injectPng300Dpi(blob) {
+  const buf = new Uint8Array(await blob.arrayBuffer());
+  // 8-byte PNG signature, then IHDR (8 hdr + 13 data + 4 crc = 25). Insert at 33.
+  if (buf.length < 33 || buf[0] !== 0x89 || buf[1] !== 0x50) return blob; // not PNG → bail
+  const PPU = 11811; // 300 dpi × (1 inch / 0.0254 m) ≈ 11811 pixels/meter
+  const chunk = new Uint8Array(4 + 4 + 9 + 4); // length + type + data + crc
+  const dv = new DataView(chunk.buffer);
+  dv.setUint32(0, 9);                        // data length
+  chunk.set([0x70, 0x48, 0x59, 0x73], 4);    // "pHYs"
+  dv.setUint32(8,  PPU);                     // ppu X
+  dv.setUint32(12, PPU);                     // ppu Y
+  chunk[16] = 1;                             // unit specifier: 1 = meter
+  dv.setUint32(17, _pngCrc32(chunk.subarray(4, 17))); // CRC over type+data
+  const out = new Uint8Array(buf.length + chunk.length);
+  out.set(buf.subarray(0, 33), 0);
+  out.set(chunk, 33);
+  out.set(buf.subarray(33), 33 + chunk.length);
+  return new Blob([out], { type: 'image/png' });
+}
 async function runPngExport(btn) {
   btn.textContent = '…'; btn.style.opacity = '.5';
   try {
     const { W, H } = getExportSize();
     const fontCSS = await getEmbeddedFont(S.fontFamily, S.fontWeight);
-    // Use user-chosen scale (1×–4×) instead of devicePixelRatio so output
-    // resolution is explicit and predictable.
-    const cv = await rasterizeFrameToCanvas(W, H, exportScale, fontCSS);
-    const blob = await new Promise(res => cv.toBlob(res, 'image/png'));
+    // 300 DPI master scale: render at 300/96 ≈ 3.125× CSS pixels MINIMUM,
+    // then take the larger of (300-DPI scale, user-chosen scale). This
+    // guarantees every PNG is print-ready ≥300 ppi regardless of UI selection.
+    const dpiScale = 300 / 96;
+    const renderScale = Math.max(dpiScale, exportScale);
+    const cv = await rasterizeFrameToCanvas(W, H, renderScale, fontCSS);
+    const rawBlob = await new Promise(res => cv.toBlob(res, 'image/png'));
+    const blob = await injectPng300Dpi(rawBlob);
     download(URL.createObjectURL(blob), `sticky_${Date.now()}.png`);
   } catch(e) {
     console.error(e);
@@ -2365,8 +2407,32 @@ function getMotionLoopDuration(type, speed) {
 
 // Periodic = every animated variable returns EXACTLY to t=0 state → no blend needed.
 // Non-periodic = irreducible phase drift at the seam → requires cross-fade.
+//
+// Per-motion start/end-frame analysis (T = period from getMotionLoopDuration):
+//   BREATHE  start: sin(0)=0 (neutral)         end: sin(2π)=0       → ZERO drift  ✓
+//   BUMP     start: sin(0)=0 (neutral)         end: sin(2π)=0       → ZERO drift  ✓
+//   WAVE     start: sin(i·0.6)                 end: sin(2π+i·0.6)   → ZERO drift  ✓
+//   STRETCH  start: cycle=0                    end: cycle≈2π then mod0 → ZERO drift ✓
+//   BUBBLE   start: 3 osc per char @ ph_i      end: 3 osc per char + (2π·r/0.15)
+//            char0 (r=0.6,fq=0.15): exact return; chars w/ irrational ratio drift
+//            → small drift on most chars → SHORT cross-fade (10%)
+//   MELT     start: 5 chars at drip01 ∈ [0, .04, .15, .32, .48]
+//            end:   per-char drip + (2π·rate/0.18) → drift dominated by 0.22..0.50
+//            rate spread → MEDIUM cross-fade (15%)
+//   FLEX     start: bp=0, beatIdx=0 (lerp from beat -1 hash)
+//            end:   bp≈1, beatIdx=3 (lerp from beat 2 hash → beat 3 hash)
+//            HARDEST seam (discrete hash table swap) → LONG cross-fade (22%)
 function isMotionPeriodic(type) {
   return type === 'breathe' || type === 'bump' || type === 'wave' || type === 'stretch';
+}
+
+// Cross-fade length as a fraction of the GIF total frame count.
+// Each non-periodic motion gets a tuned value based on its seam discontinuity.
+function getMotionOverlapFraction(type) {
+  if (type === 'flex')   return 0.22; // discrete hash-table change → needs longest bridge
+  if (type === 'melt')   return 0.15; // drip drift visible but smooth
+  if (type === 'bubble') return 0.10; // mostly self-loops; only small phase drift
+  return 0.15;
 }
 
 // Motions that mutate letterSpacing per frame — layout snapshot is not valid.
@@ -2439,9 +2505,11 @@ async function runGifExport(btn) {
     //  Cross-fade then fades from wrap-around toward natural start over `overlap`
     //  frames, hiding the discontinuity.
     const periodic = isMotionPeriodic(S.motionType);
-    // 15% of loop duration, capped 8–24 frames. Enough to mask hash-random beat
-    // changes (flex) and per-char rate drift (bubble/melt) without ghosting.
-    const overlap = periodic ? 0 : Math.min(24, Math.max(8, Math.floor(total * 0.15)));
+    // Per-motion overlap fraction (see analysis comment above getMotionOverlapFraction).
+    // Capped 8–32 frames — flex's longer 22% needs the upper headroom; lower bound
+    // ensures the cross-fade always spans enough frames to be visually smooth.
+    const overlapFrac = getMotionOverlapFraction(S.motionType);
+    const overlap = periodic ? 0 : Math.min(32, Math.max(8, Math.floor(total * overlapFrac)));
 
     if (overlap === 0) {
       // ── PERIODIC: mathematically exact loop, simple sequential render ──
@@ -2485,17 +2553,22 @@ async function runGifExport(btn) {
       // Phase 2 — render wrap-around frames [total..total+overlap-1], GPU-blend
       // with firstBitmaps[i], emit as output frames 0..overlap-1.
       //
-      // α curve: cosine smoothstep 1→0 over [0, overlap-1]:
-      //   i=0        → α=1 (pure wrap-around: motion continuity at loop point)
-      //   i=overlap-1 → α=0 (pure firstFrame: matches the un-blended frame[overlap])
-      // α=0 at the last blend frame is critical — avoids a micro-step discontinuity
-      // at the boundary between blended and un-blended output frames.
+      // α curve: smootherstep (Perlin C2-continuous) 1→0 over [0, overlap-1].
+      //   smootherstep(u) = 6u⁵ − 15u⁴ + 10u³, with u=i/denom.
+      // Both 1st and 2nd derivatives are zero at the endpoints, so the blended
+      // segment glues onto the wrap-around start (i=0, α=1) and the un-blended
+      // segment (i=overlap, α=0) without any visible velocity break — strictly
+      // smoother than the previous cosine smoothstep (which is only C1).
+      //   i=0         → α=1 (pure wrap-around: motion continuity at loop point)
+      //   i=overlap-1 → α=0 (pure firstFrame: matches un-blended frame[overlap])
       const denom = Math.max(1, overlap - 1);
       for (let i = 0; i < overlap; i++) {
         const t = ((total + i) / total) * period;
         renderMotionFrame(t, 1);
         await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
-        const alpha = (1 + Math.cos(Math.PI * (i / denom))) / 2; // cosine 1→0
+        const u = i / denom;                                     // 0 → 1
+        const s = u * u * u * (u * (u * 6 - 15) + 10);           // smootherstep 0 → 1
+        const alpha = 1 - s;                                     // 1 → 0
         blendCtx.globalAlpha = 1;
         blendCtx.drawImage(work, 0, 0);           // wrapFrame as opaque base
         blendCtx.globalAlpha = 1 - alpha;         // firstFrame contribution on top
