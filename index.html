@@ -1420,7 +1420,12 @@ function applyFrameFilter(t) {
 
 // Pure renderer — drives DOM to a specific animation time. Used by the live
 // rAF loop AND by the offline export pipeline (no real-time wait needed).
-function renderMotionFrame(rawT, easeInP = 1) {
+//
+// exportLoopBeats > 0 (only used by GIF export): activates flex's periodic
+// mode by wrapping beatIdx modulo this many beats. Effect: the random hash
+// sequence becomes a clean N-beat cycle that loops exactly. Live preview
+// passes 0 → keeps original organic-feeling random-beat behavior.
+function renderMotionFrame(rawT, easeInP = 1, exportLoopBeats = 0) {
     const t    = rawT * S.motionSpeed;
     const phi  = t * Math.PI * 2;
     const I    = S.motionIntensity * easeOutCubic(easeInP);
@@ -1575,16 +1580,25 @@ function renderMotionFrame(rawT, easeInP = 1) {
         const rEx = (targets.get(i+1) ?? 1) - 1;
         return 1 + (lEx + rEx) * 0.15;
       }
-      // ── NON-PERIODIC by design ─────────────────────────────────────────
-      // Each beat's hash is unique → no exact loop. Modular wrap (beatIdx mod 4)
-      // would make positions match at the seam BUT inverts the lerp velocity
-      // (last frame moving toward beat 3, first frame moving back toward
-      // beat 0) → a visible kink. Better: keep organic hash-random beats and
-      // let GIF export's cross-fade smooth the seam (see isMotionPeriodic).
-      const curActive = activeSet(beatIdx);
-      const prvActive = activeSet(beatIdx - 1);
-      const curT = buildTargets(beatIdx, curActive);
-      const prvT = buildTargets(beatIdx - 1, prvActive);
+      // ── DUAL MODE ──────────────────────────────────────────────────────
+      // Live preview (exportLoopBeats=0): use raw beatIdx → infinite organic
+      //   hash-random beats, never repeats, feels alive.
+      // Export (exportLoopBeats=N): wrap beatIdx mod N → the rendered loop
+      //   visits exactly N beats in a cycle (e.g. 0,1,2,3,0,1,2,3,...) and
+      //   the seam at frame[total]=frame[0] is just another normal beat
+      //   transition (last frame settles into beat N-1; first frame starts
+      //   from beat N-1 lerping toward beat 0). Position is continuous AND
+      //   the velocity profile matches every other beat boundary in the
+      //   loop — no visible kink. ZERO blending needed.
+      const flexWrap = exportLoopBeats > 0
+        ? (b => ((b % exportLoopBeats) + exportLoopBeats) % exportLoopBeats)
+        : (b => b);
+      const curIdx = flexWrap(beatIdx);
+      const prvIdx = flexWrap(beatIdx - 1);
+      const curActive = activeSet(curIdx);
+      const prvActive = activeSet(prvIdx);
+      const curT = buildTargets(curIdx, curActive);
+      const prvT = buildTargets(prvIdx, prvActive);
 
       // Oblique on the wider of the two active chars (reuse already-built targets)
       const [oA, oB]   = [...curActive];
@@ -2401,10 +2415,10 @@ function snapshotExportLayout() {
 //            Global letterSpacing pulse ALSO quantized: sin(phi·0.2) — the
 //            previous 0.18 caused sin(1.8π)≈−0.588 jump every loop wrap. ✓
 //
-// FLEX     — beat = 0.55/sp; T = 4·beatDur (= 2.2s). NON-periodic (each beat
-//            hash-unique). Cross-fade in GIF export bridges the seam — the
-//            blend stays clean because consecutive flex states only differ
-//            in scaleX of 1–2 chars (not the whole word).
+// FLEX     — beat = 0.55/sp; T = 4·beatDur (= 2.2s). Live preview uses raw
+//            beatIdx (organic forever); export passes exportLoopBeats=4 so
+//            the renderer wraps beatIdx mod 4 → 4-beat cyclic sequence. Loop
+//            seam = normal beat transition → exact periodic, no cross-fade.
 function getMotionLoopDuration(type, speed) {
   const sp = Math.max(0.01, speed || 1);
   // Every motion is now MATHEMATICALLY periodic — frame at t=T is identical
@@ -2422,7 +2436,7 @@ function getMotionLoopDuration(type, speed) {
   return (periods[type] || 2) / sp;
 }
 
-// All motions EXCEPT flex are mathematically periodic — frame at t=T equals
+// EVERY motion is mathematically periodic during export — frame at t=T equals
 // frame at t=0 to float precision. No cross-fade, no blending, no ghosting.
 //
 // Per-motion construction proof (T from getMotionLoopDuration above):
@@ -2432,14 +2446,12 @@ function getMotionLoopDuration(type, speed) {
 //   STRETCH  (phi·0.42) mod 2π, T=1/0.42 → cycle returns to 0                  ✓
 //   BUBBLE   sin(phi·k + const_i), k ∈ {N·0.2}, T=5 → 2π·N exact return        ✓
 //   MELT     −cos(phi·k + const_i) AND sin(phi·0.2) kerning, k all N·0.2, T=5  ✓
+//   FLEX     beatIdx wrapped mod 4 (export-only, via exportLoopBeats=4) →
+//            cyclic 4-beat sequence; loop seam is just another beat transition ✓
 //
-// FLEX is NON-periodic (each beat has a unique hash → no clean loop). Modular
-// wrap would make positions match at the seam but invert the lerp velocity
-// direction → a visible kink. Better solution: keep the organic hash-random
-// beats and use a small GPU cross-fade in GIF export to smooth the seam (the
-// blend has minimal ghosting because consecutive flex states differ only in
-// scaleX of 1–2 chars, not the whole word).
-function isMotionPeriodic(type) { return type !== 'flex'; }
+// Live preview keeps flex's raw beatIdx (organic random forever); only the
+// export rasterizer activates the wrap → preview feel preserved, GIF loops.
+function isMotionPeriodic() { return true; }
 
 // Motions that mutate letterSpacing per frame — layout snapshot is not valid.
 function motionChangesLayout(type) {
@@ -2496,82 +2508,21 @@ async function runGifExport(btn) {
     const work = document.createElement('canvas');
 
     // ── Loop-quality strategy ───────────────────────────────────────────
-    // Periodic motions (breathe/bump/wave/stretch/bubble/melt) return to
-    // their exact t=0 state at t=period → straight render, zero blending.
-    // Non-periodic motions (flex only) get a 3-phase render with a small
-    // GPU cross-fade to smooth the velocity flip at the seam.
-    const periodic = isMotionPeriodic(S.motionType);
-    // Cross-fade length only used when !periodic. Capped to keep ghosting
-    // small; flex's per-frame state differs only in 1–2 chars so blending
-    // looks natural.
-    const overlap = periodic ? 0 : Math.min(20, Math.max(8, Math.floor(total * 0.18)));
-
-    if (overlap === 0) {
-      // ── PERIODIC: mathematically exact loop, simple sequential render ──
-      for (let i = 0; i < total; i++) {
-        const t = (i / total) * period;
-        renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
-        gif.addFrame(work, { delay: frameDelay, copy: true });
-        setProgress((i + 1) / total * 0.5);
-        btn.textContent = `${i + 1}/${total}`;
-        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
-      }
-    } else {
-      // ── NON-PERIODIC (flex): 3-phase render with GPU cross-fade ────────
-      // Phase 1: cache first `overlap` frames as GPU ImageBitmaps.
-      // Phase 2: render wrap-around frames [total..total+overlap), blend
-      //          with cached firstBitmaps via smootherstep alpha (1→0).
-      // Phase 3: render remaining frames [overlap..total) directly.
-      const blendCanvas = document.createElement('canvas');
-      blendCanvas.width = Wp; blendCanvas.height = Hp;
-      const blendCtx = blendCanvas.getContext('2d', { colorSpace: 'srgb' });
-      const totalSteps = total + overlap;
-      let step = 0;
-
-      const firstBitmaps = [];
-      for (let i = 0; i < overlap; i++) {
-        const t = (i / total) * period;
-        renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
-        firstBitmaps.push(await createImageBitmap(work));
-        step++;
-        setProgress(step / totalSteps * 0.5);
-        btn.textContent = `${step}/${total}`;
-        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
-      }
-
-      const denom = Math.max(1, overlap - 1);
-      for (let i = 0; i < overlap; i++) {
-        const t = ((total + i) / total) * period;
-        renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
-        const u = i / denom;
-        const s = u * u * u * (u * (u * 6 - 15) + 10);   // smootherstep 0→1
-        const alpha = 1 - s;                              // 1→0
-        blendCtx.globalAlpha = 1;
-        blendCtx.drawImage(work, 0, 0);                   // wrap frame as base
-        blendCtx.globalAlpha = 1 - alpha;                 // first frame on top
-        blendCtx.drawImage(firstBitmaps[i], 0, 0);
-        blendCtx.globalAlpha = 1;
-        gif.addFrame(blendCanvas, { delay: frameDelay, copy: true });
-        step++;
-        setProgress(step / totalSteps * 0.5);
-        btn.textContent = `${step}/${total}`;
-        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
-      }
-      firstBitmaps.forEach(b => b.close());
-
-      for (let i = overlap; i < total; i++) {
-        const t = (i / total) * period;
-        renderMotionFrame(t, 1);
-        await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
-        gif.addFrame(work, { delay: frameDelay, copy: true });
-        step++;
-        setProgress(step / totalSteps * 0.5);
-        btn.textContent = `${step}/${total}`;
-        if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
-      }
+    // Every motion is now mathematically periodic during export. For flex,
+    // pass exportLoopBeats=4 so beatIdx wraps mod 4 → the rendered sequence
+    // visits exactly 4 beats per loop and the seam is just a normal beat
+    // boundary. All other motions ignore the parameter (no flex code path).
+    // Result: zero blending, zero ghosting, perfect loop for every motion.
+    const FLEX_LOOP_BEATS = 4;
+    const exportLoopBeats = S.motionType === 'flex' ? FLEX_LOOP_BEATS : 0;
+    for (let i = 0; i < total; i++) {
+      const t = (i / total) * period;
+      renderMotionFrame(t, 1, exportLoopBeats);
+      await rasterizeFrameToCanvas(W, H, dpr, fontCSS, work, layoutSnap);
+      gif.addFrame(work, { delay: frameDelay, copy: true });
+      setProgress((i + 1) / total * 0.5);
+      btn.textContent = `${i + 1}/${total}`;
+      if (i % 8 === 7) await new Promise(r => setTimeout(r, 0));
     }
     btn.textContent = 'Encoding…';
     showProgress('Encoding GIF…', 0.5);
@@ -3204,7 +3155,8 @@ function hpStartAnim(type) {
         const lEx = (targets.get(i-1)??1)-1, rEx = (targets.get(i+1)??1)-1;
         return 1 + (lEx+rEx)*0.15;
       }
-      // NON-PERIODIC: organic hash-random beats; export uses cross-fade to seam
+      // Live preview: raw beatIdx (organic forever). Export wraps mod 4 via
+      // exportLoopBeats parameter on renderMotionFrame for clean GIF loops.
       const hpCur = hpActiveSet(beatIdx);
       const hpPrv = hpActiveSet(beatIdx-1);
       const hpCurT = hpBuildT(beatIdx, hpCur);
