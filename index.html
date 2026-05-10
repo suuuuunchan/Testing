@@ -1640,7 +1640,14 @@ function renderMotionFrame(rawT, easeInP = 1) {
 
       // Slow global kerning pulse — chars drift toward each other,
       // triggering gooey bridges, then pull apart.
-      const kOsc = Math.sin(phi * 0.18);
+      // CRITICAL: frequency MUST be a multiple of 1/T_melt (= 0.2 Hz) so the
+      // kerning value at t=T equals t=0. Using 0.18 (the original "musical"
+      // value) breaks this — sin(2π·5·0.18) = sin(1.8π) ≈ −0.588 ≠ 0, which
+      // causes letterSpacing to snap by ~0.04·I em at every loop wrap →
+      // every char shifts horizontally → ugly visible seam under the goo
+      // filter. 0.2 is sonically nearly identical (period 5s vs 5.56s) but
+      // mathematically locks: sin(2π·5·0.2) = sin(2π) = 0 exactly.
+      const kOsc = Math.sin(phi * 0.2);
       stickyText.style.letterSpacing = (S.kerning + kOsc * I * 0.07) + 'em';
 
       // Filter stays active throughout; extra blur proportional to intensity.
@@ -2391,7 +2398,9 @@ function snapshotExportLayout() {
 //            Every sin(phi·k) returns exactly to its t=0 value at t=T. ✓
 //
 // MELT     — Per-char drip rate quantized: rate ∈ {0.2, 0.4, 0.6} (multiples of
-//            1/T at T=5s). −cos(phi·rate + i·0.4) is exact periodic at T. ✓
+//            1/T at T=5s). −cos(phi·rate + i·0.4) is exact periodic at T.
+//            Global letterSpacing pulse ALSO quantized: sin(phi·0.2) — the
+//            previous 0.18 caused sin(1.8π)≈−0.588 jump every loop wrap. ✓
 //
 // FLEX     — beat = 0.55/sp; hash inputs WRAPPED via (beatIdx mod 4). Beat 4
 //            ≡ beat 0, beat −1 ≡ beat 3. End-of-loop state (beat 3, bp≈1)
